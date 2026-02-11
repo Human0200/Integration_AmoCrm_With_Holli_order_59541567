@@ -206,6 +206,7 @@ function processAmoCrmLead(int $leadId): void
 
     $contractLink = extractContractLinkFromLead($lead);
 
+    log_info("ССЫЛКА ДАГАВОРА", $contractLink, 'index.php');
     if ($contractLink !== null) {
         updateContractInHollyhopByEmail($lead, $contractLink);
     }
