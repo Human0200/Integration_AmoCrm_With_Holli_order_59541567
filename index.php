@@ -25,6 +25,7 @@ const AMO_FIELD_MATURITY = 1575213;
 const AMO_FIELD_OFFICE_OR_COMPANY = 1596219;
 const AMO_FIELD_RESPONSIBLE_USER = 1590693;
 const AMO_FIELD_PROFILE_LINK = 1630807;
+const AMO_FIELD_CONTRACT_LINK = 1632483;
 
 const AMO_CONTACT_FIELD_PHONE = 1138327;
 const AMO_CONTACT_FIELD_EMAIL = 1138329;
@@ -34,7 +35,7 @@ const HOLLYHOP_CONNECT_TIMEOUT = 15;
 const HOLLYHOP_API_TIMEOUT = 60;
 
 const AMO_DEALS_FIELD_NAME = 'Сделки АМО';
-
+const HOLLYHOP_CONTRACT_FIELD_NAME = 'Договор Оки';
 // ============================================================================
 // ОБРАБОТКА ВЕБХУКА ОТ OKIDOKI
 // ============================================================================
@@ -203,11 +204,71 @@ function processAmoCrmLead(int $leadId): void
         return;
     }
 
+    $contractLink = extractContractLinkFromLead($lead);
+
+    if ($contractLink !== null) {
+        updateContractInHollyhopByEmail($lead, $contractLink);
+    }
     $hollyhopResponse = sendStudentToHollyhop($studentData);
 
     if ($hollyhopResponse !== null) {
         processHollyhopResponse($hollyhopResponse, $leadId, $lead);
     }
+}
+
+function extractContractLinkFromLead(array $lead): ?string
+{
+    foreach ($lead["custom_fields_values"] ?? [] as $field) {
+        if (($field["field_id"] ?? null) === AMO_FIELD_CONTRACT_LINK) {
+            return $field["values"][0]["value"] ?? null;
+        }
+    }
+    return null;
+}
+
+
+function updateContractInHollyhopByEmail(array $lead, string $contractLink): void
+{
+    global $subdomain, $data;
+
+    $contactId = $lead["_embedded"]["contacts"][0]["id"] ?? null;
+    if (!$contactId) return;
+
+    $contact = get($subdomain, "/api/v4/contacts/{$contactId}", $data);
+
+    $email = null;
+    foreach ($contact["custom_fields_values"] ?? [] as $field) {
+        if (($field["field_code"] ?? null) === 'EMAIL') {
+            $email = $field["values"][0]["value"] ?? null;
+        }
+    }
+
+    if (!$email) return;
+
+    $apiConfig = get_config('api');
+    $authKey = $apiConfig['auth_key'];
+    $apiBaseUrl = $apiConfig['base_url'];
+
+    // Ищем студента по email
+    $student = callHollyhopApi('GetStudents', [
+        'email' => $email
+    ], $authKey, $apiBaseUrl);
+
+    if (empty($student)) return;
+
+    $clientId = $student['ClientId'] ?? $student[0]['ClientId'] ?? null;
+    if (!$clientId) return;
+
+    // Обновляем поле
+    callHollyhopApi('EditUserExtraFields', [
+        'studentClientId' => $clientId,
+        'fields' => [
+            [
+                'name' => HOLLYHOP_CONTRACT_FIELD_NAME,
+                'value' => $contractLink
+            ]
+        ]
+    ], $authKey, $apiBaseUrl);
 }
 
 /**
