@@ -267,6 +267,7 @@ function updateContractInHollyhopByEmail(array $lead, string $contractLink): voi
             }
         }
     }
+    log_info('clientId', $clientId, 'index.php');
     if (!$clientId) return;
 
     log_info("TEST: обновляем поле Договор Оки", [
