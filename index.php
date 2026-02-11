@@ -204,13 +204,6 @@ function processAmoCrmLead(int $leadId): void
         return;
     }
 
-    $contractLink = extractContractLinkFromLead($lead);
-    $clientId = extractClientIdFromProfileLink($lead);
-    log_info("clientId", $clientId, "index.php");
-
-    if ($contractLink && $clientId) {
-        updateContractInHollyhopByClientId((int)$clientId, $contractLink);
-    }
     $hollyhopResponse = sendStudentToHollyhop($studentData);
 
     if ($hollyhopResponse !== null) {
@@ -218,54 +211,6 @@ function processAmoCrmLead(int $leadId): void
     }
 }
 
-function extractContractLinkFromLead(array $lead): ?string
-{
-    foreach ($lead["custom_fields_values"] ?? [] as $field) {
-        if (($field["field_id"] ?? null) === AMO_FIELD_CONTRACT_LINK) {
-            return $field["values"][0]["value"] ?? null;
-        }
-    }
-    return null;
-}
-
-function extractClientIdFromProfileLink(array $lead): ?int
-{
-    foreach ($lead["custom_fields_values"] ?? [] as $field) {
-        if (($field["field_id"] ?? null) === AMO_FIELD_PROFILE_LINK) {
-            $url = $field["values"][0]["value"] ?? '';
-            if (preg_match('~/Profile/(\d+)~', $url, $m)) {
-                return (int)$m[1];
-            }
-        }
-    }
-    return null;
-}
-
-function updateContractInHollyhopByClientId(int $clientId, string $contractLink): void
-{
-    $apiConfig = get_config('api');
-    $authKey = $apiConfig['auth_key'];
-    $apiBaseUrl = $apiConfig['base_url'];
-
-    log_info("Обновляем Договор Оки", [
-        'clientId' => $clientId,
-        'contract_link' => $contractLink
-    ], 'index.php');
-
-    callHollyhopApi('EditUserExtraFields', [
-        'studentClientId' => $clientId,
-        'fields' => [
-            [
-                'name' => HOLLYHOP_CONTRACT_FIELD_NAME,
-                'value' => $contractLink
-            ]
-        ]
-    ], $authKey, $apiBaseUrl);
-
-    log_info("Договор Оки обновлён", [
-        'clientId' => $clientId
-    ], 'index.php');
-}
 
 /**
  * Получает данные сделки из AmoCRM
@@ -574,8 +519,20 @@ function updateLeadProfileLink(int $leadId, string $profileLink): void
     }
 }
 
+
+function extractContractLinkFromLead(array $lead): ?string
+{
+    foreach ($lead["custom_fields_values"] ?? [] as $field) {
+        if (($field["field_id"] ?? null) === AMO_FIELD_CONTRACT_LINK) {
+            return $field["values"][0]["value"] ?? null;
+        }
+    }
+    return null;
+}
+
+
 /**
- * Обновляет поле "Сделки АМО" в Hollyhop
+ * Обновляет поле "Сделки АМО" и "Договор Оки" в Hollyhop
  */
 function updateHollyhopAmoDeal(int $clientId, int $leadId, array $lead): void
 {
@@ -585,6 +542,9 @@ function updateHollyhopAmoDeal(int $clientId, int $leadId, array $lead): void
     $amoDealUrl = "https://{$subdomain}.amocrm.ru/leads/detail/{$leadId}";
     $amoDealLink = buildHtmlLink($amoDealUrl, "{$managerName}: {$leadId}");
 
+    // 🔥 Получаем ссылку договора из сделки
+    $contractLink = extractContractLinkFromLead($lead);
+
     try {
         $apiConfig = get_config('api');
         $authKey = $apiConfig['auth_key'];
@@ -593,16 +553,38 @@ function updateHollyhopAmoDeal(int $clientId, int $leadId, array $lead): void
         $student = fetchStudentFromHollyhop($clientId, $authKey, $apiBaseUrl);
 
         if ($student === null) {
-            log_warning("Студент не найден в Hollyhop для обновления поля 'Сделки АМО'", [
+            log_warning("Студент не найден в Hollyhop", [
                 'clientId' => $clientId
             ], 'index.php');
             return;
         }
 
+        // === Обновляем поле "Сделки АМО" (как было)
         $allExtraFields = extractAllExtraFields($student, $amoDealLink);
-        updateStudentExtraFields($clientId, $allExtraFields, $authKey, $apiBaseUrl, $leadId, $amoDealLink);
+
+        // === 🔥 Добавляем/обновляем поле "Договор Оки"
+        if (!empty($contractLink)) {
+            $allExtraFields[] = [
+                'name'  => 'Договор Оки',
+                'value' => $contractLink
+            ];
+
+            log_info("Добавляем поле Договор Оки", [
+                'clientId' => $clientId,
+                'contract_link' => $contractLink
+            ], 'index.php');
+        }
+
+        updateStudentExtraFields(
+            $clientId,
+            $allExtraFields,
+            $authKey,
+            $apiBaseUrl,
+            $leadId,
+            $amoDealLink
+        );
     } catch (Exception $e) {
-        log_error("Ошибка при обновлении поля 'Сделки АМО' в Hollyhop", [
+        log_error("Ошибка при обновлении полей в Hollyhop", [
             'error' => $e->getMessage(),
             'clientId' => $clientId,
             'lead_id' => $leadId
