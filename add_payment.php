@@ -1197,13 +1197,13 @@ try {
     // Определяем paymentMethodId на основе наличия "Ссылки на оплату"
     // Если поле "Ссылка на оплату" заполнено → paymentMethodId = 23 (Тбанк)
     // Если не заполнено → paymentMethodId = 19 (ПСБ)
-
+    // Если счет оплачен в амо - в холи передается статус "Ожидает проведения"
     function mapAmoStatusToHollyState(string $amoStatus): string
     {
         $amoStatus = mb_strtolower(trim($amoStatus));
 
         return match (true) {
-            str_contains($amoStatus, 'оплачен') => 'Paid',
+            str_contains($amoStatus, 'оплачен') => 'Unconfirmed',
             str_contains($amoStatus, 'част') => 'Unconfirmed',
             str_contains($amoStatus, 'не оплачен') => 'Unpaid',
             str_contains($amoStatus, 'отмен') => 'Unpaid',
