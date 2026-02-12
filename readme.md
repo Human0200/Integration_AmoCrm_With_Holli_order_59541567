@@ -660,6 +660,11 @@ HOLLYHOP_AMO_DEALS_FIELD_ID=  # Опционально
 
 ---
 
+### Полезные ссылки
+
+- https://hollipedia.t8s.ru/books/api/page/hollihop-api-20
+
+---
 
 **Логи**:
 - `logs/app.log` - основной лог
