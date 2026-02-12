@@ -50,6 +50,133 @@ if (isOkiDokiSignedContract($okiData)) {
 }
 
 // ============================================================================
+// 🔥 НОВОЕ: СПЕЦИАЛЬНЫЙ ВЕБХУК ДЛЯ ОТПРАВКИ ДОГОВОРА В ХОЛИ
+// ============================================================================
+
+if (isset($_GET['document']) && $_GET['document'] === 'true') {
+    log_info("Специальный вебхук для отправки договора в Холи", [
+        'GET' => $_GET,
+        'lead_id' => $_POST["leads"]["update"][0]["id"] ?? null
+    ], 'index.php');
+    
+    $leadId = isset($_POST["leads"]["update"][0]["id"]) ? (int) $_POST["leads"]["update"][0]["id"] : null;
+    
+    if (!$leadId) {
+        log_error("Не удалось определить lead_id", $_POST, 'index.php');
+        exit;
+    }
+    
+    try {
+        // Получаем данные сделки
+        $lead = fetchLeadData($leadId);
+        
+        // ПРОВЕРКА: если поля "Ссылка на Холи" НЕТ - пропускаем
+        $profileLinkExists = false;
+        foreach ($lead["custom_fields_values"] ?? [] as $field) {
+            if (($field["field_id"] ?? null) == AMO_FIELD_PROFILE_LINK) {
+                $profileLinkExists = true;
+                break;
+            }
+        }
+        
+        if (!$profileLinkExists) {
+            log_info("Ссылка на Холи не заполнена, студент еще не создан - пропускаем", [
+                'lead_id' => $leadId
+            ], 'index.php');
+            exit;
+        }
+        
+        log_info("Ссылка на Холи найдена, продолжаем обработку", [
+            'lead_id' => $leadId
+        ], 'index.php');
+        
+        // 2️⃣ Формируем данные студента
+        $studentData = buildStudentDataFromLead($lead, $leadId);
+        
+        if (!isset($studentData["firstName"])) {
+            log_warning("Имя студента не указано, пропуск", ['lead_id' => $leadId], 'index.php');
+            exit;
+        }
+        
+        // 3️⃣ Отправляем в Холи
+        $hollyhopResponse = sendStudentToHollyhop($studentData);
+        
+        if ($hollyhopResponse === null) {
+            log_error("Не удалось отправить данные в Холи", ['lead_id' => $leadId], 'index.php');
+            exit;
+        }
+        
+        // 4️⃣ Получаем clientId из ответа
+        $clientId = $hollyhopResponse["clientId"] ?? null;
+        
+        if (!$clientId) {
+            log_error("clientId не получен от Холи", ['response' => $hollyhopResponse], 'index.php');
+            exit;
+        }
+        
+        // 5️⃣ Получаем ссылку на договор
+        $contractLink = extractContractLinkFromLead($lead);
+        
+        if (!$contractLink) {
+            log_warning("Ссылка на договор не найдена", ['lead_id' => $leadId], 'index.php');
+            exit;
+        }
+        
+        log_info("Данные успешно отправлены, clientId получен", [
+            'client_id' => $clientId,
+            'lead_id' => $leadId
+        ], 'index.php');
+        
+        // 6️⃣ Обновляем поле договора
+        $apiConfig = get_config('api');
+        $authKey = $apiConfig['auth_key'];
+        $apiBaseUrl = $apiConfig['base_url'];
+        
+        $student = fetchStudentFromHollyhop($clientId, $authKey, $apiBaseUrl);
+        
+        if ($student) {
+            $allExtraFields = [];
+            foreach ($student['ExtraFields'] ?? [] as $field) {
+                $fieldName = $field['Name'] ?? $field['name'] ?? '';
+                $fieldValue = $field['Value'] ?? $field['value'] ?? '';
+                
+                if ($fieldName !== 'Договор Оки') {
+                    $allExtraFields[] = [
+                        'name' => $fieldName,
+                        'value' => $fieldValue
+                    ];
+                }
+            }
+            
+            $allExtraFields[] = [
+                'name' => 'Договор Оки',
+                'value' => $contractLink
+            ];
+            
+            $updateParams = [
+                'studentClientId' => $clientId,
+                'fields' => $allExtraFields
+            ];
+            
+            $result = callHollyhopApi('EditUserExtraFields', $updateParams, $authKey, $apiBaseUrl);
+            
+            log_info("Договор успешно отправлен в Холи", [
+                'client_id' => $clientId,
+                'lead_id' => $leadId
+            ], 'index.php');
+        }
+        
+    } catch (Exception $e) {
+        log_error("Ошибка при отправке договора", [
+            'lead_id' => $leadId,
+            'error' => $e->getMessage()
+        ], 'index.php');
+    }
+    
+    exit('OK');
+}
+
+// ============================================================================
 // ОБРАБОТКА ВЕБХУКА ОТ AMOCRM
 // ============================================================================
 
@@ -156,6 +283,8 @@ function updateContactInfo(int $contactId, string $name, string $email): void
         ], 'index.php');
     }
 }
+
+
 
 // ============================================================================
 // ФУНКЦИИ ОБРАБОТКИ AMOCRM
