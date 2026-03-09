@@ -4,12 +4,32 @@ require_once('./amo_func.php');
 // --- Конфигурация ---
 $subdomain = 'directorchinatutorru';
 $target_field_id = 1598377; // ID поля "Канал"
-$log_file = __DIR__ . '/logs/salebot_debug.txt'; // Файл для логов
+$log_file = __DIR__ . '/logs/salebot_debug.txt';
 // --------------------
 
-// Функция для записи в лог
-function write_log($message, $data = [], $debug = true) {
-    if($debug == true){
+// Правильный маппинг значений
+$enum_map = [
+    'Instagram' => 7557063,  // insta SB
+    'VK' => 7557061,         // vk SB
+    'Telegram' => 7557065,   // TG SB
+    'WhatsApp' => 7557067,   // WA SB
+    'Онлайн-чат' => 7557069, // Онлайн-чат
+    'MAX' => 7557059         // max SB
+];
+
+// Маппинг client_type в названия каналов
+$client_type_to_name = [
+    '0' => 'VK',
+    '1' => 'Telegram',
+    '4' => 'MAX',      // Viber -> max SB
+    '5' => 'Онлайн-чат',
+    '6' => 'WhatsApp',
+    '8' => 'MAX',      // Facebook -> max SB
+    '10' => 'Instagram',
+    '13' => 'MAX'      // Телефония -> max SB
+];
+
+function write_log($message, $data = []) {
     global $log_file;
     $timestamp = date('Y-m-d H:i:s');
     $log_entry = "[{$timestamp}] {$message}\n";
@@ -19,33 +39,37 @@ function write_log($message, $data = [], $debug = true) {
     $log_entry .= "----------------------------------------\n";
     file_put_contents($log_file, $log_entry, FILE_APPEND);
 }
-}
 
-// Получаем данные из вебхука Salebot
 $inputJSON = file_get_contents('php://input');
 $salebot_data = json_decode($inputJSON, true);
 
 write_log('SALEBOT WEBHOOK ПОЛУЧЕН', $salebot_data);
 
 if (!$salebot_data) {
-    write_log('ОШИБКА: Не удалось декодировать JSON', ['input' => substr($inputJSON, 0, 500)]);
+    write_log('ОШИБКА: Не удалось декодировать JSON');
     http_response_code(200);
     echo "OK - invalid JSON";
     exit;
 }
 
-// Извлекаем данные из вебхука
+// Извлекаем данные
 $amo_unsorted_id = $salebot_data['client']['variables']['amo_unsorted_id'] ?? null;
 $amo_client_id = $salebot_data['client']['variables']['amo_client_id'] ?? null;
+$amo_lead_id = $salebot_data['client']['order_variables']['amo_lead_id'] ?? null;
 $client_type = $salebot_data['client']['client_type'] ?? null;
+
+// Также проверяем поле messenger если есть
+$messenger = $salebot_data['client']['variables']['messenger'] ?? null;
 
 write_log('ИЗВЛЕЧЕННЫЕ ДАННЫЕ', [
     'amo_unsorted_id' => $amo_unsorted_id,
     'amo_client_id' => $amo_client_id,
-    'client_type' => $client_type
+    'amo_lead_id' => $amo_lead_id,
+    'client_type' => $client_type,
+    'messenger' => $messenger
 ]);
 
-if (!$amo_unsorted_id && !$amo_client_id) {
+if (!$amo_unsorted_id && !$amo_client_id && !$amo_lead_id) {
     write_log('ОШИБКА: Нет ни одного идентификатора');
     http_response_code(200);
     echo "OK - no identifiers";
@@ -55,8 +79,24 @@ if (!$amo_unsorted_id && !$amo_client_id) {
 $lead_id = null;
 $found_by = null;
 
-// --- 1. Пробуем найти по amo_unsorted_id ---
-if ($amo_unsorted_id) {
+// --- 1. Пробуем найти по amo_lead_id ---
+if ($amo_lead_id) {
+    write_log('ПОИСК ПО amo_lead_id: ' . $amo_lead_id);
+    
+    try {
+        $lead_data = get($subdomain, "/api/v4/leads/{$amo_lead_id}", $GLOBALS['data']);
+        if ($lead_data && isset($lead_data['id'])) {
+            $lead_id = $lead_data['id'];
+            $found_by = 'lead_id';
+            write_log('НАЙДЕНО через lead_id', ['lead_id' => $lead_id]);
+        }
+    } catch (Exception $e) {
+        write_log('Сделка не найдена по lead_id', ['error' => $e->getMessage()]);
+    }
+}
+
+// --- 2. Пробуем найти по amo_unsorted_id ---
+if (!$lead_id && $amo_unsorted_id) {
     write_log('ПОИСК ПО amo_unsorted_id: ' . $amo_unsorted_id);
     
     try {
@@ -72,7 +112,7 @@ if ($amo_unsorted_id) {
     }
 }
 
-// --- 2. Если не нашли по unsorted_id, пробуем по amo_client_id ---
+// --- 3. Если не нашли, пробуем по amo_client_id ---
 if (!$lead_id && $amo_client_id) {
     write_log('ПОИСК ПО amo_client_id: ' . $amo_client_id);
     
@@ -97,7 +137,6 @@ if (!$lead_id && $amo_client_id) {
     }
 }
 
-// --- 3. Если не нашли ---
 if (!$lead_id) {
     write_log('ОШИБКА: Сделка не найдена ни по одному идентификатору');
     http_response_code(200);
@@ -106,25 +145,38 @@ if (!$lead_id) {
 }
 
 // --- 4. Определяем канал ---
-if (!$client_type) {
-    write_log('ОШИБКА: Нет client_type');
+$channel_name = null;
+
+// Сначала пробуем по messenger если есть
+if ($messenger && isset($enum_map[$messenger])) {
+    $channel_name = $messenger;
+    write_log('Канал определен через messenger', ['messenger' => $messenger]);
+} 
+// Иначе по client_type
+elseif ($client_type !== null && isset($client_type_to_name[(string)$client_type])) {
+    $channel_name = $client_type_to_name[(string)$client_type];
+    write_log('Канал определен через client_type', [
+        'client_type' => $client_type,
+        'channel_name' => $channel_name
+    ]);
+}
+
+if (!$channel_name) {
+    write_log('ОШИБКА: Не удалось определить канал', [
+        'client_type' => $client_type,
+        'messenger' => $messenger
+    ]);
     http_response_code(200);
-    echo "OK - no client_type";
+    echo "OK - unknown channel";
     exit;
 }
 
-$client_type_map = [
-    '0' => 7557061,  // VK
-    '1' => 7557065,  // Telegram
-    '4' => 7557059,  // Viber -> max SB
-    '6' => 7557067,  // WhatsApp
-    '8' => 7557059,  // Facebook -> max SB
-    '10' => 7557063, // Instagram
-    '13' => 7557059  // Телефония -> max SB
-];
-
-$enum_id = $client_type_map[$client_type] ?? 7557059;
-write_log('ОПРЕДЕЛЕН КАНАЛ', ['client_type' => $client_type, 'enum_id' => $enum_id]);
+$enum_id = $enum_map[$channel_name] ?? 7557059; // MAX по умолчанию
+write_log('ОПРЕДЕЛЕН КАНАЛ', [
+    'channel_name' => $channel_name,
+    'enum_id' => $enum_id,
+    'found_by' => $found_by
+]);
 
 // --- 5. Получаем текущее значение ---
 $current_enum_id = null;
@@ -180,6 +232,7 @@ if ($current_enum_id === $enum_id) {
             'lead_id' => $lead_id,
             'old_value' => $current_enum_id,
             'new_value' => $enum_id,
+            'channel_name' => $channel_name,
             'found_by' => $found_by
         ]);
         
