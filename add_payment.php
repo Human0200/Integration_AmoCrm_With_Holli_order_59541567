@@ -46,6 +46,11 @@ require_once __DIR__ . '/amo_func.php';
 // Загружаем конфигурацию из .env файла
 require_once __DIR__ . '/config.php';
 
+const AMO_FIELD_PROFILE_LINK = 1630807;
+const AMO_CONTACT_FIELD_PHONE = 1138327;
+const AMO_CONTACT_FIELD_EMAIL = 1138329;
+const ADD_STUDENT_ENDPOINT = 'https://srm.chinatutor.ru/add_student.php';
+
 /**
  * Функции логирования для add_payment.php (запись в отдельный файл pay.log)
  */
@@ -117,6 +122,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 // Проверяем метод запроса
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
+    log_payment_warning("Получен запрос с неподдерживаемым методом", ['method' => $_SERVER['REQUEST_METHOD']]);
     echo json_encode([
         'success' => false,
         'error' => 'Метод не поддерживается. Используйте POST.'
@@ -186,6 +192,284 @@ function call_hollyhop_api($function_name, $params, $auth_key, $api_base_url)
     // Успешный ответ (логируем только при ошибках)
 
     return $result;
+}
+
+/**
+ * Извлекает ID профиля студента из объекта студента Hollyhop.
+ */
+function extract_student_profile_id(array $student): ?int
+{
+    $profile_id = $student['Id'] ?? $student['id'] ?? null;
+    if ($profile_id === null || $profile_id === '') {
+        return null;
+    }
+
+    return is_numeric($profile_id) ? (int) $profile_id : null;
+}
+
+/**
+ * Формирует ссылку на профиль Hollyhop.
+ */
+function build_hollyhop_profile_link(int $profile_id, string $hollyhop_subdomain): string
+{
+    return "https://{$hollyhop_subdomain}.t8s.ru/Profile/{$profile_id}";
+}
+
+/**
+ * Обновляет поле "Ссылка на профиль" в сделке AmoCRM.
+ */
+function update_lead_profile_link_in_amocrm(int $lead_id, string $profile_link, string $subdomain, array $data): void
+{
+    $lead_update = [
+        'id' => $lead_id,
+        'custom_fields_values' => [
+            [
+                'field_id' => AMO_FIELD_PROFILE_LINK,
+                'values' => [
+                    ['value' => $profile_link]
+                ]
+            ]
+        ]
+    ];
+
+    post_or_patch($subdomain, $lead_update, "/api/v4/leads/{$lead_id}", $data, 'PATCH');
+}
+
+/**
+ * Получает данные первого контакта сделки для payload add_student.php.
+ */
+function extract_contact_data_from_lead(int $lead_id, array $lead, string $subdomain, array $data): array
+{
+    $result = [
+        'firstName' => null,
+        'lastName' => null,
+        'phone' => null,
+        'email' => null
+    ];
+
+    $contact_id = $lead['_embedded']['contacts'][0]['id'] ?? null;
+
+    if (!$contact_id) {
+        try {
+            $lead_with_contacts = get($subdomain, "/api/v4/leads/{$lead_id}?with=contacts", $data);
+            $contact_id = $lead_with_contacts['_embedded']['contacts'][0]['id'] ?? null;
+        } catch (Exception $e) {
+            log_payment_warning("Не удалось получить контакты сделки для ensure student", [
+                'lead_id' => $lead_id,
+                'error' => $e->getMessage()
+            ]);
+            return $result;
+        }
+    }
+
+    if (!$contact_id) {
+        return $result;
+    }
+
+    try {
+        $contact = get($subdomain, "/api/v4/contacts/{$contact_id}", $data);
+    } catch (Exception $e) {
+        log_payment_warning("Не удалось получить контакт для ensure student", [
+            'lead_id' => $lead_id,
+            'contact_id' => $contact_id,
+            'error' => $e->getMessage()
+        ]);
+        return $result;
+    }
+
+    $contact_name = trim((string) ($contact['name'] ?? ''));
+    if ($contact_name !== '') {
+        $name_parts = preg_split('/\s+/u', $contact_name);
+        if (!empty($name_parts[0])) {
+            $result['firstName'] = $name_parts[0];
+        }
+        if (!empty($name_parts[1])) {
+            $result['lastName'] = $name_parts[1];
+        }
+    }
+
+    $contact_fields = $contact['custom_fields_values'] ?? [];
+    foreach ($contact_fields as $field) {
+        $field_id = $field['field_id'] ?? null;
+        $field_value = $field['values'][0]['value'] ?? null;
+        if ($field_value === null || $field_value === '') {
+            continue;
+        }
+
+        if ($field_id == AMO_CONTACT_FIELD_PHONE && empty($result['phone'])) {
+            $result['phone'] = trim((string) $field_value);
+        } elseif ($field_id == AMO_CONTACT_FIELD_EMAIL && empty($result['email'])) {
+            $result['email'] = trim((string) $field_value);
+        }
+    }
+
+    return $result;
+}
+
+/**
+ * Формирует payload для add_student.php из данных сделки и контакта.
+ */
+function build_student_payload_for_add_student(int $lead_id, array $lead, string $subdomain, array $data): array
+{
+    $payload = [
+        'Status' => 'В наборе',
+        'gender' => 'F',
+        'link' => "https://{$subdomain}.amocrm.ru/leads/detail/{$lead_id}",
+        'amo_lead_id' => $lead_id,
+        'amo_subdomain' => $subdomain
+    ];
+
+    $lead_field_map = [
+        1575217 => 'discipline',
+        1576357 => 'level',
+        1575221 => 'learningType',
+        1575213 => 'maturity',
+        1596219 => 'officeOrCompanyId',
+        1590693 => 'responsible_user'
+    ];
+
+    foreach ($lead['custom_fields_values'] ?? [] as $field) {
+        $field_id = $field['field_id'] ?? null;
+        $value = $field['values'][0]['value'] ?? null;
+
+        if ($field_id === null || $value === null || $value === '') {
+            continue;
+        }
+
+        if (isset($lead_field_map[$field_id])) {
+            $payload[$lead_field_map[$field_id]] = $value;
+        }
+    }
+
+    $contact_data = extract_contact_data_from_lead($lead_id, $lead, $subdomain, $data);
+    if (!empty($contact_data['firstName'])) {
+        $payload['firstName'] = $contact_data['firstName'];
+    }
+    if (!empty($contact_data['lastName'])) {
+        $payload['lastName'] = $contact_data['lastName'];
+    }
+    if (!empty($contact_data['phone'])) {
+        $payload['phone'] = $contact_data['phone'];
+    }
+    if (!empty($contact_data['email'])) {
+        $payload['email'] = $contact_data['email'];
+    }
+
+    if (empty($payload['firstName'])) {
+        $payload['firstName'] = '-';
+    }
+    if (empty($payload['lastName'])) {
+        $payload['lastName'] = '-';
+    }
+
+    return $payload;
+}
+
+/**
+ * Вызывает основной скрипт add_student.php.
+ */
+function call_add_student_script(array $payload): array
+{
+    $json_data = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    if ($json_data === false) {
+        throw new Exception("Не удалось закодировать payload для add_student.php");
+    }
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => ADD_STUDENT_ENDPOINT,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $json_data,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'Content-Length: ' . strlen($json_data)
+        ],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 120,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curl_error = curl_error($ch);
+    curl_close($ch);
+
+    if ($curl_error) {
+        throw new Exception("Ошибка вызова add_student.php: {$curl_error}");
+    }
+
+    if ($http_code >= 400) {
+        throw new Exception("add_student.php вернул HTTP {$http_code}: " . substr((string) $response, 0, 500));
+    }
+
+    $decoded = json_decode(trim((string) $response), true);
+    if (!is_array($decoded)) {
+        throw new Exception("Некорректный JSON от add_student.php");
+    }
+
+    if (isset($decoded['success']) && $decoded['success'] === false) {
+        $error_text = $decoded['error'] ?? 'Неизвестная ошибка add_student.php';
+        throw new Exception("add_student.php: {$error_text}");
+    }
+
+    return $decoded;
+}
+
+/**
+ * Обеспечивает наличие карточки ученика в Hollyhop до отправки оплаты.
+ */
+function ensure_student_card_for_payment(int $lead_id, array $lead, string $subdomain, array $data): array
+{
+    $payload = build_student_payload_for_add_student($lead_id, $lead, $subdomain, $data);
+
+    log_payment_info("clientId не найден. Запускаем add_student.php перед AddPayment", [
+        'lead_id' => $lead_id,
+        'has_phone' => !empty($payload['phone']),
+        'has_email' => !empty($payload['email'])
+    ]);
+
+    $response = call_add_student_script($payload);
+
+    $client_id = $response['clientId'] ?? $response['ClientId'] ?? null;
+    if (!$client_id) {
+        $fallback_profile_id = $response['Id'] ?? $response['id'] ?? null;
+        if ($fallback_profile_id) {
+            $client_id = $fallback_profile_id;
+        }
+    }
+
+    if (!$client_id) {
+        throw new Exception("add_student.php не вернул clientId");
+    }
+
+    $profile_link = isset($response['link']) ? trim((string) $response['link']) : null;
+    if ($profile_link === '') {
+        $profile_link = null;
+    }
+
+    if ($profile_link) {
+        try {
+            update_lead_profile_link_in_amocrm($lead_id, $profile_link, $subdomain, $data);
+            log_payment_info("Ссылка на профиль обновлена в сделке после add_student.php", [
+                'lead_id' => $lead_id,
+                'profile_link' => $profile_link
+            ]);
+        } catch (Exception $e) {
+            log_payment_warning("Не удалось обновить ссылку на профиль в сделке после add_student.php", [
+                'lead_id' => $lead_id,
+                'profile_link' => $profile_link,
+                'error' => $e->getMessage()
+            ]);
+        }
+    }
+
+    return [
+        'client_id' => $client_id,
+        'profile_link' => $profile_link,
+        'profile_id' => $response['Id'] ?? $response['id'] ?? null,
+        'response' => $response
+    ];
 }
 
 /**
@@ -498,10 +782,10 @@ try {
 
                     $page++;
 
-                    // Защита от бесконечного цикла (максимум 20 страниц = 5000 сделок)
-                    if ($page > 20) {
+                    // Защита от бесконечного цикла (максимум 25 страниц = 6250 сделок)
+                    if ($page > 25) {
                         log_payment_warning("Достигнут лимит страниц при получении сделок", [
-                            'max_pages' => 20,
+                            'max_pages' => 25,
                             'total_processed' => $total_processed,
                             'total_checked' => $total_checked
                         ]);
@@ -864,6 +1148,7 @@ try {
     $client_id = null;
     $custom_fields_values = $LEAD["custom_fields_values"] ?? [];
     $profile_link = null;
+    $resolved_profile_id = null;
 
     // Список возможных field_id для clientId (можно добавить в конфиг)
     // Пока используем пустой массив - нужно будет указать field_id после настройки поля в AmoCRM
@@ -892,8 +1177,11 @@ try {
         }
 
         // Сохраняем ссылку на профиль для дальнейшего использования
-        if ($field_id == 1630807 && !empty($field_value)) {
-            $profile_link = $field_value;
+        if ($field_id == AMO_FIELD_PROFILE_LINK && !empty($field_value)) {
+            $profile_link = trim((string) $field_value);
+            if (preg_match('/\/Profile\/(\d+)/', $profile_link, $matches)) {
+                $resolved_profile_id = (int) $matches[1];
+            }
         }
     }
 
@@ -927,6 +1215,7 @@ try {
                 }
 
                 if ($student_info) {
+                    $resolved_profile_id = $resolved_profile_id ?: extract_student_profile_id($student_info);
                     $client_id = $student_info['ClientId'] ?? $student_info['clientId'] ?? null;
                     if ($client_id) {
                         log_payment_info("clientId получен через GetStudents", [
@@ -959,95 +1248,199 @@ try {
         }
     }
 
-    // Если clientId всё ещё не найден, пытаемся найти студента по контактам сделки
-    if (!$client_id) {
-        try {
-            // Получаем контакты сделки
-            $api_url = '/api/v4/leads/' . $lead_id . '?with=contacts';
-            $LEAD_WITH_CONTACTS = get($subdomain, $api_url, $data);
+if (!$client_id) {
+    try {
+        // Получаем контакты сделки
+        $api_url = '/api/v4/leads/' . $lead_id . '?with=contacts';
+        $LEAD_WITH_CONTACTS = get($subdomain, $api_url, $data);
 
-            $contact_phone = null;
-            $contact_email = null;
+        $contact_phone = null;
+        $contact_email = null;
 
-            // Извлекаем телефон и email из контактов
-            if (
-                isset($LEAD_WITH_CONTACTS['_embedded']['contacts']) &&
-                is_array($LEAD_WITH_CONTACTS['_embedded']['contacts']) &&
-                !empty($LEAD_WITH_CONTACTS['_embedded']['contacts'])
-            ) {
+        // Извлекаем телефон и email из контактов
+        if (
+            isset($LEAD_WITH_CONTACTS['_embedded']['contacts']) &&
+            is_array($LEAD_WITH_CONTACTS['_embedded']['contacts']) &&
+            !empty($LEAD_WITH_CONTACTS['_embedded']['contacts'])
+        ) {
 
-                $contact_id = $LEAD_WITH_CONTACTS['_embedded']['contacts'][0]['id'] ?? null;
-                if ($contact_id) {
-                    $api_url = '/api/v4/contacts/' . $contact_id;
-                    $CONTACT = get($subdomain, $api_url, $data);
+            $contact_id = $LEAD_WITH_CONTACTS['_embedded']['contacts'][0]['id'] ?? null;
+            if ($contact_id) {
+                $api_url = '/api/v4/contacts/' . $contact_id;
+                $CONTACT = get($subdomain, $api_url, $data);
 
-                    $contact_fields = $CONTACT['custom_fields_values'] ?? [];
-                    foreach ($contact_fields as $field) {
-                        $field_id = $field['field_id'] ?? null;
-                        $field_value = $field['values'][0]['value'] ?? null;
+                $contact_fields = $CONTACT['custom_fields_values'] ?? [];
+                foreach ($contact_fields as $field) {
+                    $field_id = $field['field_id'] ?? null;
+                    $field_value = $field['values'][0]['value'] ?? null;
 
-                        // Телефон (обычно field_id 1138327) и email (1138329)
-                        if ($field_id == 1138327) {
-                            $contact_phone = $field_value;
-                        } elseif ($field_id == 1138329) {
-                            $contact_email = $field_value;
+                    // Телефон (обычно field_id 1138327) и email (1138329)
+                    if ($field_id == AMO_CONTACT_FIELD_PHONE) {
+                        $contact_phone = preg_replace('/[^0-9]/', '', $field_value); // Очищаем телефон
+                    } elseif ($field_id == AMO_CONTACT_FIELD_EMAIL) {
+                        $contact_email = strtolower(trim($field_value)); // Нормализуем email
+                    }
+                }
+            }
+        }
+
+        // Пытаемся найти студента по телефону или email
+        if ($contact_phone || $contact_email) {
+            $search_params = [];
+            if ($contact_phone) {
+                $search_params['phone'] = $contact_phone;
+            } elseif ($contact_email) {
+                $search_params['email'] = $contact_email;
+            }
+
+            log_payment_info("Поиск студента в Hollyhop по контактам", $search_params);
+
+            $api_response = call_hollyhop_api('GetStudents', $search_params, $auth_key, $api_base_url);
+
+            // Обрабатываем ответ GetStudents
+            $found_students = [];
+            if (is_array($api_response)) {
+                if (isset($api_response['Students']) && is_array($api_response['Students'])) {
+                    $found_students = $api_response['Students'];
+                } elseif (isset($api_response['ClientId']) || isset($api_response['clientId'])) {
+                    $found_students = [$api_response];
+                } elseif (is_array($api_response) && !empty($api_response) && isset($api_response[0])) {
+                    $found_students = $api_response;
+                }
+            }
+
+            if (!empty($found_students)) {
+                // ИСПРАВЛЕНИЕ: Фильтруем найденных студентов по точному соответствию
+                $matched_student = null;
+                
+                // Очищаем искомый телефон для сравнения
+                $search_phone_clean = $contact_phone ? preg_replace('/[^0-9]/', '', $contact_phone) : null;
+                $search_email_lower = $contact_email ? strtolower(trim($contact_email)) : null;
+                
+                foreach ($found_students as $student) {
+                    $student_id = $student['ClientId'] ?? $student['clientId'] ?? null;
+                    
+                    // Пропускаем студентов без ID
+                    if (!$student_id) continue;
+                    
+                    // Проверяем телефоны студента
+                    if ($search_phone_clean) {
+                        $student_phones = [];
+                        
+                        // Собираем все телефоны из разных полей студента
+                        if (isset($student['Phone'])) {
+                            $student_phones[] = $student['Phone'];
+                        }
+                        if (isset($student['phone'])) {
+                            $student_phones[] = $student['phone'];
+                        }
+                        if (isset($student['MobilePhone'])) {
+                            $student_phones[] = $student['MobilePhone'];
+                        }
+                        if (isset($student['mobilePhone'])) {
+                            $student_phones[] = $student['mobilePhone'];
+                        }
+                        if (isset($student['HomePhone'])) {
+                            $student_phones[] = $student['HomePhone'];
+                        }
+                        if (isset($student['AdditionalPhones']) && is_array($student['AdditionalPhones'])) {
+                            $student_phones = array_merge($student_phones, $student['AdditionalPhones']);
+                        }
+                        
+                        // Очищаем и проверяем каждый телефон
+                        foreach ($student_phones as $student_phone) {
+                            $student_phone_clean = preg_replace('/[^0-9]/', '', $student_phone);
+                            if ($student_phone_clean === $search_phone_clean) {
+                                $matched_student = $student;
+                                break 2; // Выходим из обоих циклов
+                            }
+                        }
+                    }
+                    
+                    // Проверяем email студента
+                    if ($search_email_lower && !$matched_student) {
+                        $student_email = null;
+                        
+                        if (isset($student['Email'])) {
+                            $student_email = strtolower(trim($student['Email']));
+                        } elseif (isset($student['email'])) {
+                            $student_email = strtolower(trim($student['email']));
+                        }
+                        
+                        if ($student_email && $student_email === $search_email_lower) {
+                            $matched_student = $student;
+                            break;
                         }
                     }
                 }
-            }
-
-            // Пытаемся найти студента по телефону или email
-            if ($contact_phone || $contact_email) {
-                $search_params = [];
-                if ($contact_phone) {
-                    $search_params['phone'] = $contact_phone;
-                } elseif ($contact_email) {
-                    $search_params['email'] = $contact_email;
-                }
-
-                log_payment_info("Поиск студента в Hollyhop по контактам", $search_params);
-
-                $api_response = call_hollyhop_api('GetStudents', $search_params, $auth_key, $api_base_url);
-
-                // Обрабатываем ответ GetStudents
-                $found_students = [];
-                if (is_array($api_response)) {
-                    if (isset($api_response['Students']) && is_array($api_response['Students'])) {
-                        $found_students = $api_response['Students'];
-                    } elseif (isset($api_response['ClientId']) || isset($api_response['clientId'])) {
-                        $found_students = [$api_response];
-                    } elseif (is_array($api_response) && !empty($api_response) && isset($api_response[0])) {
-                        $found_students = $api_response;
-                    }
-                }
-
-                if (!empty($found_students)) {
-                    // Берем первого найденного студента
-                    $found_student = $found_students[0];
-                    $client_id = $found_student['ClientId'] ?? $found_student['clientId'] ?? null;
-
-                    if ($client_id) {
-                        log_payment_info("clientId найден через поиск по контактам", [
-                            'clientId' => $client_id,
-                            'search_by' => $contact_phone ? 'phone' : 'email',
-                            'students_found' => count($found_students)
-                        ]);
-                    } else {
-                        log_payment_warning("Студент найден по контактам, но clientId отсутствует", [
-                            'found_students_count' => count($found_students)
-                        ]);
-                    }
-                } else {
-                    log_payment_warning("Студент не найден в Hollyhop по контактам", [
-                        'search_params' => $search_params
+                
+                // Если нашли точное совпадение, используем его
+                if ($matched_student) {
+                    $resolved_profile_id = $resolved_profile_id ?: extract_student_profile_id($matched_student);
+                    $client_id = $matched_student['ClientId'] ?? $matched_student['clientId'] ?? null;
+                    
+                    log_payment_info("clientId найден через поиск по контактам (точное совпадение)", [
+                        'clientId' => $client_id,
+                        'search_by' => $contact_phone ? 'phone' : 'email',
+                        'total_found' => count($found_students)
                     ]);
+                } else {
+                    // Если точного совпадения нет, логируем предупреждение
+                    log_payment_warning("Найдены студенты, но нет точного совпадения по контактам", [
+                        'students_found' => count($found_students),
+                        'search_phone' => $search_phone_clean,
+                        'search_email' => $search_email_lower
+                    ]);
+                    
+                    // Дополнительно логируем первых нескольких студентов для отладки
+                    $debug_students = array_slice($found_students, 0, 3);
+                    foreach ($debug_students as $idx => $student) {
+                        log_payment_debug("Студент " . ($idx + 1) . " для отладки", [
+                            'clientId' => $student['ClientId'] ?? $student['clientId'] ?? 'N/A',
+                            'phone' => $student['Phone'] ?? $student['phone'] ?? 'N/A',
+                            'email' => $student['Email'] ?? $student['email'] ?? 'N/A'
+                        ]);
+                    }
                 }
             } else {
-                log_payment_warning("В сделке не найдены контакты (телефон/email) для поиска студента");
+                log_payment_warning("Студент не найден в Hollyhop по контактам", [
+                    'search_params' => $search_params
+                ]);
             }
-        } catch (Exception $contact_e) {
-            log_payment_warning("Ошибка при поиске студента по контактам", [
-                'error' => $contact_e->getMessage()
+        } else {
+            log_payment_warning("В сделке не найдены контакты (телефон/email) для поиска студента");
+        }
+    } catch (Exception $contact_e) {
+        log_payment_warning("Ошибка при поиске студента по контактам", [
+            'error' => $contact_e->getMessage()
+        ]);
+    }
+}
+
+    // Если clientId не найден стандартными способами, запускаем полный сценарий add_student.php
+    if (!$client_id) {
+        try {
+            $ensure_result = ensure_student_card_for_payment($lead_id, $LEAD, $subdomain, $data);
+            $client_id = $ensure_result['client_id'] ?? null;
+            $resolved_profile_id = is_numeric($ensure_result['profile_id'] ?? null)
+                ? (int) $ensure_result['profile_id']
+                : $resolved_profile_id;
+
+            if (!empty($ensure_result['profile_link'])) {
+                $profile_link = $ensure_result['profile_link'];
+            }
+
+            if ($client_id) {
+                log_payment_info("clientId получен через add_student.php", [
+                    'lead_id' => $lead_id,
+                    'clientId' => $client_id,
+                    'profile_link' => $profile_link
+                ]);
+            }
+        } catch (Exception $ensure_student_e) {
+            log_payment_warning("Не удалось обеспечить карточку через add_student.php", [
+                'lead_id' => $lead_id,
+                'error' => $ensure_student_e->getMessage()
             ]);
         }
     }
@@ -1082,6 +1475,7 @@ try {
 
     // Получаем officeOrCompanyId из данных студента через GetStudents
     $office_id = null;
+    $student_info = null;
     try {
         $get_student_params = [
             'clientId' => $client_id
@@ -1093,8 +1487,6 @@ try {
         // 1. Объект с полем Students (массив студентов)
         // 2. Массив студентов напрямую
         // 3. Один объект студента (при использовании clientId)
-        $student_info = null;
-
         if (is_array($api_response)) {
             // Проверяем, это массив студентов или объект с полем Students
             if (isset($api_response['Students']) && is_array($api_response['Students'])) {
@@ -1132,6 +1524,8 @@ try {
             ]);
             throw new Exception("Студент с clientId = {$client_id} не найден в системе Hollyhop");
         }
+
+        $resolved_profile_id = $resolved_profile_id ?: extract_student_profile_id($student_info);
 
         // Извлекаем officeOrCompanyId из данных студента
         // Сначала пробуем прямые поля
@@ -1182,6 +1576,34 @@ try {
             'error' => $e->getMessage()
         ]);
         exit;
+    }
+
+    // Если ссылка на профиль в сделке отсутствует, восстанавливаем ее перед AddPayment
+    if (!$profile_link && $resolved_profile_id) {
+        $hollyhop_subdomain = $api_config['subdomain'] ?? null;
+        if (!empty($hollyhop_subdomain)) {
+            $profile_link = build_hollyhop_profile_link($resolved_profile_id, $hollyhop_subdomain);
+            try {
+                update_lead_profile_link_in_amocrm($lead_id, $profile_link, $subdomain, $data);
+                log_payment_info("Ссылка на профиль восстановлена в сделке перед AddPayment", [
+                    'lead_id' => $lead_id,
+                    'profile_id' => $resolved_profile_id,
+                    'profile_link' => $profile_link
+                ]);
+            } catch (Exception $e) {
+                log_payment_warning("Не удалось сохранить восстановленную ссылку на профиль в сделке", [
+                    'lead_id' => $lead_id,
+                    'profile_id' => $resolved_profile_id,
+                    'profile_link' => $profile_link,
+                    'error' => $e->getMessage()
+                ]);
+            }
+        } else {
+            log_payment_warning("Невозможно восстановить ссылку на профиль: не задан subdomain Hollyhop в конфиге", [
+                'lead_id' => $lead_id,
+                'profile_id' => $resolved_profile_id
+            ]);
+        }
     }
 
     // Формируем параметры для AddPayment
