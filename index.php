@@ -3,9 +3,11 @@
 /**
  * Главный обработчик вебхуков от AmoCRM и OkiDoki
  * 
- * Обрабатывает два типа событий:
+ * Обрабатывает три типа событий:
  * 1. Подписание договора через OkiDoki (JSON webhook)
  * 2. События сделок AmoCRM (создание/изменение статуса)
+ * 3. Вызов из add_payment.php (?payment_webhook=1) — создание/поиск студента,
+ *    возврат чистого JSON с clientId и ссылкой на профиль
  */
 
 declare(strict_types=1);
@@ -18,31 +20,124 @@ require_once __DIR__ . '/amo_func.php';
 // КОНСТАНТЫ
 // ============================================================================
 
-const AMO_FIELD_DISCIPLINE = 1575217;
-const AMO_FIELD_LEVEL = 1576357;
+const AMO_FIELD_DISCIPLINE    = 1575217;
+const AMO_FIELD_LEVEL         = 1576357;
 const AMO_FIELD_LEARNING_TYPE = 1575221;
-const AMO_FIELD_MATURITY = 1575213;
+const AMO_FIELD_MATURITY      = 1575213;
 const AMO_FIELD_OFFICE_OR_COMPANY = 1596219;
-const AMO_FIELD_RESPONSIBLE_USER = 1590693;
-const AMO_FIELD_PROFILE_LINK = 1630807;
-const AMO_FIELD_CONTRACT_LINK = 1632483;
+const AMO_FIELD_RESPONSIBLE_USER  = 1590693;
+const AMO_FIELD_PROFILE_LINK      = 1630807;
+const AMO_FIELD_CONTRACT_LINK     = 1632483;
 
 const AMO_CONTACT_FIELD_PHONE = 1138327;
 const AMO_CONTACT_FIELD_EMAIL = 1138329;
 
-const HOLLYHOP_TIMEOUT = 120;
+const HOLLYHOP_TIMEOUT         = 120;
 const HOLLYHOP_CONNECT_TIMEOUT = 15;
-const HOLLYHOP_API_TIMEOUT = 60;
+const HOLLYHOP_API_TIMEOUT     = 60;
 
-const AMO_DEALS_FIELD_NAME = 'Сделки АМО';
+const AMO_DEALS_FIELD_NAME      = 'Сделки АМО';
 const HOLLYHOP_CONTRACT_FIELD_NAME = 'Договор Оки';
+
+// ============================================================================
+// РЕЖИМ ?payment_webhook=1
+// Вызывается из add_payment.php — нужно просто найти или создать студента
+// и вернуть чистый JSON. Не смотрим на стадию и не обрабатываем document.
+// ============================================================================
+
+if (isset($_GET['payment_webhook']) && $_GET['payment_webhook'] === '1') {
+
+    $leadId = isset($_POST["leads"]["add"][0]["id"])
+        ? (int) $_POST["leads"]["add"][0]["id"]
+        : null;
+
+    if (!$leadId) {
+        http_response_code(400);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode([
+            'success' => false,
+            'error'   => 'Не передан lead_id'
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    log_info("payment_webhook=1: запрос на создание/поиск студента", [
+        'lead_id' => $leadId
+    ], 'index.php');
+
+    try {
+        // Получаем данные сделки
+        $lead = fetchLeadData($leadId);
+
+        // Формируем данные студента и отправляем в Hollyhop
+        $studentData = buildStudentDataFromLead($lead, $leadId);
+
+        if (!isset($studentData['firstName'])) {
+            $studentData['firstName'] = '-';
+        }
+        if (!isset($studentData['lastName'])) {
+            $studentData['lastName'] = '-';
+        }
+
+        $hollyhopResponse = sendStudentToHollyhop($studentData);
+
+        if ($hollyhopResponse === null) {
+            throw new Exception("Не удалось отправить данные студента в Hollyhop");
+        }
+
+        $clientId    = $hollyhopResponse['clientId'] ?? null;
+        $profileLink = $hollyhopResponse['link'] ?? null;
+        $profileId   = $hollyhopResponse['Id'] ?? $hollyhopResponse['id'] ?? null;
+
+        if ($profileLink) {
+            // Записываем ссылку на профиль в сделку AmoCRM
+            updateLeadProfileLink($leadId, $profileLink);
+        }
+
+        // Обновляем поле "Сделки АМО" если есть clientId
+        if ($clientId !== null) {
+            updateHollyhopAmoDeal($clientId, $leadId, $lead);
+        }
+
+        log_info("payment_webhook=1: студент найден/создан", [
+            'lead_id'      => $leadId,
+            'clientId'     => $clientId,
+            'profile_link' => $profileLink
+        ], 'index.php');
+
+        header('Content-Type: application/json; charset=utf-8');
+        http_response_code(200);
+        echo json_encode([
+            'success'      => true,
+            'clientId'     => $clientId,
+            'Id'           => $profileId,
+            'link'         => $profileLink,
+            'operation'    => $hollyhopResponse['operation'] ?? 'processed',
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+    } catch (Exception $e) {
+        log_error("payment_webhook=1: ошибка", [
+            'lead_id' => $leadId,
+            'error'   => $e->getMessage()
+        ], 'index.php');
+
+        header('Content-Type: application/json; charset=utf-8');
+        http_response_code(500);
+        echo json_encode([
+            'success' => false,
+            'error'   => $e->getMessage()
+        ], JSON_UNESCAPED_UNICODE);
+    }
+
+    exit;
+}
 
 // ============================================================================
 // ОБРАБОТКА ВЕБХУКА ОТ OKIDOKI
 // ============================================================================
 
 $rawInput = file_get_contents('php://input');
-$okiData = json_decode($rawInput, true);
+$okiData  = json_decode($rawInput, true);
 
 if (isOkiDokiSignedContract($okiData)) {
     handleOkiDokiSignedContract($okiData);
@@ -50,27 +145,26 @@ if (isOkiDokiSignedContract($okiData)) {
 }
 
 // ============================================================================
-// 🔥 НОВОЕ: СПЕЦИАЛЬНЫЙ ВЕБХУК ДЛЯ ОТПРАВКИ ДОГОВОРА В ХОЛИ
+// СПЕЦИАЛЬНЫЙ ВЕБХУК ДЛЯ ОТПРАВКИ ДОГОВОРА В ХОЛИ (?document=true)
 // ============================================================================
 
 if (isset($_GET['document']) && $_GET['document'] === 'true') {
     log_info("Специальный вебхук для отправки договора в Холи", [
-        'GET' => $_GET,
+        'GET'     => $_GET,
         'lead_id' => $_POST["leads"]["update"][0]["id"] ?? null
     ], 'index.php');
-    
+
     $leadId = isset($_POST["leads"]["update"][0]["id"]) ? (int) $_POST["leads"]["update"][0]["id"] : null;
-    
+
     if (!$leadId) {
         log_error("Не удалось определить lead_id", $_POST, 'index.php');
         exit;
     }
-    
+
     try {
-        // Получаем данные сделки
         $lead = fetchLeadData($leadId);
-        
-        // ПРОВЕРКА: если поля "Ссылка на Холи" НЕТ - пропускаем
+
+        // ПРОВЕРКА: если поля "Ссылка на Холи" НЕТ — пропускаем
         $profileLinkExists = false;
         foreach ($lead["custom_fields_values"] ?? [] as $field) {
             if (($field["field_id"] ?? null) == AMO_FIELD_PROFILE_LINK) {
@@ -78,106 +172,85 @@ if (isset($_GET['document']) && $_GET['document'] === 'true') {
                 break;
             }
         }
-        
+
         if (!$profileLinkExists) {
-            log_info("Ссылка на Холи не заполнена, студент еще не создан - пропускаем", [
+            log_info("Ссылка на Холи не заполнена, студент еще не создан — пропускаем", [
                 'lead_id' => $leadId
             ], 'index.php');
             exit;
         }
-        
-        log_info("Ссылка на Холи найдена, продолжаем обработку", [
-            'lead_id' => $leadId
-        ], 'index.php');
-        
-        // 2️⃣ Формируем данные студента
+
         $studentData = buildStudentDataFromLead($lead, $leadId);
-        
+
         if (!isset($studentData["firstName"])) {
             log_warning("Имя студента не указано, пропуск", ['lead_id' => $leadId], 'index.php');
             exit;
         }
-        
-        // 3️⃣ Отправляем в Холи
+
         $hollyhopResponse = sendStudentToHollyhop($studentData);
-        
+
         if ($hollyhopResponse === null) {
             log_error("Не удалось отправить данные в Холи", ['lead_id' => $leadId], 'index.php');
             exit;
         }
-        
-        // 4️⃣ Получаем clientId из ответа
+
         $clientId = $hollyhopResponse["clientId"] ?? null;
-        
+
         if (!$clientId) {
             log_error("clientId не получен от Холи", ['response' => $hollyhopResponse], 'index.php');
             exit;
         }
-        
-        // 5️⃣ Получаем ссылку на договор
+
         $contractLink = extractContractLinkFromLead($lead);
-        
+
         if (!$contractLink) {
             log_warning("Ссылка на договор не найдена", ['lead_id' => $leadId], 'index.php');
             exit;
         }
-        
-        log_info("Данные успешно отправлены, clientId получен", [
-            'client_id' => $clientId,
-            'lead_id' => $leadId
-        ], 'index.php');
-        
-        // 6️⃣ Обновляем поле договора
-        $apiConfig = get_config('api');
-        $authKey = $apiConfig['auth_key'];
-        $apiBaseUrl = $apiConfig['base_url'];
-        
+
+        $apiConfig   = get_config('api');
+        $authKey     = $apiConfig['auth_key'];
+        $apiBaseUrl  = $apiConfig['base_url'];
+
         $student = fetchStudentFromHollyhop($clientId, $authKey, $apiBaseUrl);
-        
+
         if ($student) {
             $allExtraFields = [];
             foreach ($student['ExtraFields'] ?? [] as $field) {
-                $fieldName = $field['Name'] ?? $field['name'] ?? '';
+                $fieldName  = $field['Name'] ?? $field['name'] ?? '';
                 $fieldValue = $field['Value'] ?? $field['value'] ?? '';
-                
                 if ($fieldName !== 'Договор Оки') {
-                    $allExtraFields[] = [
-                        'name' => $fieldName,
-                        'value' => $fieldValue
-                    ];
+                    $allExtraFields[] = ['name' => $fieldName, 'value' => $fieldValue];
                 }
             }
-            
-            $allExtraFields[] = [
-                'name' => 'Договор Оки',
-                'value' => $contractLink
-            ];
-            
+
+            $allExtraFields[] = ['name' => 'Договор Оки', 'value' => $contractLink];
+
             $updateParams = [
                 'studentClientId' => $clientId,
-                'fields' => $allExtraFields
+                'fields'          => $allExtraFields
             ];
-            
-            $result = callHollyhopApi('EditUserExtraFields', $updateParams, $authKey, $apiBaseUrl);
-            
+
+            callHollyhopApi('EditUserExtraFields', $updateParams, $authKey, $apiBaseUrl);
+
             log_info("Договор успешно отправлен в Холи", [
                 'client_id' => $clientId,
-                'lead_id' => $leadId
+                'lead_id'   => $leadId
             ], 'index.php');
         }
-        
+
     } catch (Exception $e) {
         log_error("Ошибка при отправке договора", [
             'lead_id' => $leadId,
-            'error' => $e->getMessage()
+            'error'   => $e->getMessage()
         ], 'index.php');
     }
-    
+
     exit('OK');
 }
 
 // ============================================================================
-// ОБРАБОТКА ВЕБХУКА ОТ AMOCRM
+// ОБРАБОТКА ВЕБХУКА ОТ AMOCRM (обычный режим)
 // ============================================================================
 
 log_info("Вебхук от AmoCRM получен", $_POST, 'index.php');
@@ -194,8 +267,8 @@ try {
 } catch (Exception $e) {
     log_error("Критическая ошибка при обработке сделки", [
         'lead_id' => $leadId,
-        'error' => $e->getMessage(),
-        'trace' => $e->getTraceAsString()
+        'error'   => $e->getMessage(),
+        'trace'   => $e->getTraceAsString()
     ], 'index.php');
     die("Ошибка: " . $e->getMessage());
 }
@@ -204,24 +277,18 @@ try {
 // ФУНКЦИИ ОБРАБОТКИ OKIDOKI
 // ============================================================================
 
-/**
- * Проверяет, является ли вебхук событием подписания договора OkiDoki
- */
 function isOkiDokiSignedContract(?array $data): bool
 {
     return isset($data['status']) && $data['status'] === 'signed';
 }
 
-/**
- * Обрабатывает событие подписания договора OkiDoki
- */
 function handleOkiDokiSignedContract(array $okiData): void
 {
     global $subdomain, $data;
 
     $leadId = $okiData['lead_id'] ?? null;
-    $fio = $okiData['extra_fields']['ФИО клиента'] ?? '';
-    $email = $okiData['extra_fields']['E-Mail клиента'] ?? '';
+    $fio    = $okiData['extra_fields']['ФИО клиента'] ?? '';
+    $email  = $okiData['extra_fields']['E-Mail клиента'] ?? '';
 
     if (!$leadId) {
         log_warning("OkiDoki вебхук без lead_id", $okiData, 'index.php');
@@ -237,9 +304,6 @@ function handleOkiDokiSignedContract(array $okiData): void
     }
 }
 
-/**
- * Получает ID контакта из сделки
- */
 function getContactIdFromLead(int $leadId): ?int
 {
     global $subdomain, $data;
@@ -250,15 +314,12 @@ function getContactIdFromLead(int $leadId): ?int
     } catch (Exception $e) {
         log_error("Ошибка при получении контакта из сделки", [
             'lead_id' => $leadId,
-            'error' => $e->getMessage()
+            'error'   => $e->getMessage()
         ], 'index.php');
         return null;
     }
 }
 
-/**
- * Обновляет информацию о контакте
- */
 function updateContactInfo(int $contactId, string $name, string $email): void
 {
     global $subdomain, $data;
@@ -268,7 +329,7 @@ function updateContactInfo(int $contactId, string $name, string $email): void
         'custom_fields_values' => [
             [
                 'field_code' => 'EMAIL',
-                'values' => [['value' => $email, 'enum_code' => 'WORK']]
+                'values'     => [['value' => $email, 'enum_code' => 'WORK']]
             ]
         ]
     ];
@@ -279,20 +340,15 @@ function updateContactInfo(int $contactId, string $name, string $email): void
     } catch (Exception $e) {
         log_error("Ошибка при обновлении контакта", [
             'contact_id' => $contactId,
-            'error' => $e->getMessage()
+            'error'      => $e->getMessage()
         ], 'index.php');
     }
 }
-
-
 
 // ============================================================================
 // ФУНКЦИИ ОБРАБОТКИ AMOCRM
 // ============================================================================
 
-/**
- * Извлекает ID сделки из вебхука AmoCRM
- */
 function extractLeadIdFromWebhook(array $post): ?int
 {
     if (isset($post["leads"]["add"][0]["id"])) {
@@ -310,9 +366,6 @@ function extractLeadIdFromWebhook(array $post): ?int
     return null;
 }
 
-/**
- * Основная функция обработки сделки AmoCRM
- */
 function processAmoCrmLead(int $leadId): void
 {
     $lead = fetchLeadData($leadId);
@@ -328,7 +381,7 @@ function processAmoCrmLead(int $leadId): void
 
     if (!isset($studentData["firstName"])) {
         log_warning("Имя студента не указано, пропуск отправки", [
-            'json' => $studentData,
+            'json'    => $studentData,
             'lead_id' => $leadId
         ], 'index.php');
         return;
@@ -341,10 +394,6 @@ function processAmoCrmLead(int $leadId): void
     }
 }
 
-
-/**
- * Получает данные сделки из AmoCRM
- */
 function fetchLeadData(int $leadId): array
 {
     global $subdomain, $data;
@@ -358,25 +407,19 @@ function fetchLeadData(int $leadId): array
     } catch (Exception $e) {
         log_error("Ошибка при получении данных сделки из AmoCRM", [
             'lead_id' => $leadId,
-            'error' => $e->getMessage()
+            'error'   => $e->getMessage()
         ], 'index.php');
         throw $e;
     }
 }
 
-/**
- * Проверяет наличие необходимых данных в сделке
- */
 function hasRequiredLeadData(array $lead): bool
 {
     $customFieldsValues = $lead["custom_fields_values"] ?? [];
 
     if (empty($customFieldsValues) || !is_array($customFieldsValues)) {
         log_warning("Сделка не содержит кастомных полей или они пусты", [
-            'lead_id' => $lead['id'] ?? 'unknown',
-            'has_custom_fields' => isset($lead["custom_fields_values"]),
-            'custom_fields_is_null' => ($lead["custom_fields_values"] ?? null) === null,
-            'custom_fields_type' => gettype($lead["custom_fields_values"] ?? null)
+            'lead_id' => $lead['id'] ?? 'unknown'
         ], 'index.php');
         return false;
     }
@@ -384,26 +427,21 @@ function hasRequiredLeadData(array $lead): bool
     return true;
 }
 
-/**
- * Формирует данные студента из данных сделки и контакта
- */
 function buildStudentDataFromLead(array $lead, int $leadId): array
 {
     global $subdomain;
 
     $studentData = [
-        'Status' => 'В наборе',
-        'link' => "https://{$subdomain}.amocrm.ru/leads/detail/{$leadId}",
-        'gender' => 'F',
-        'amo_lead_id' => $leadId,
+        'Status'        => 'В наборе',
+        'link'          => "https://{$subdomain}.amocrm.ru/leads/detail/{$leadId}",
+        'gender'        => 'F',
+        'amo_lead_id'   => $leadId,
         'amo_subdomain' => $subdomain,
     ];
 
-    // Извлекаем кастомные поля сделки
     $customFieldsValues = $lead["custom_fields_values"] ?? [];
     $studentData = array_merge($studentData, extractLeadCustomFields($customFieldsValues));
 
-    // Извлекаем данные контакта
     $contactId = $lead["_embedded"]["contacts"][0]["id"] ?? null;
     if ($contactId !== null) {
         $contactData = extractContactData($contactId);
@@ -413,16 +451,13 @@ function buildStudentDataFromLead(array $lead, int $leadId): array
     return $studentData;
 }
 
-/**
- * Извлекает кастомные поля сделки
- */
 function extractLeadCustomFields(array $customFieldsValues): array
 {
     $fields = [];
 
     foreach ($customFieldsValues as $field) {
         $fieldId = $field["field_id"] ?? null;
-        $value = $field["values"][0]["value"] ?? null;
+        $value   = $field["values"][0]["value"] ?? null;
 
         if ($fieldId === null || $value === null) {
             continue;
@@ -453,9 +488,6 @@ function extractLeadCustomFields(array $customFieldsValues): array
     return $fields;
 }
 
-/**
- * Извлекает данные контакта
- */
 function extractContactData(int $contactId): array
 {
     global $subdomain, $data;
@@ -465,7 +497,6 @@ function extractContactData(int $contactId): array
 
         $contactData = [];
 
-        // Разбираем имя на части
         $nameParts = explode(" ", $contact["name"] ?? "");
         if (isset($nameParts[0])) {
             $contactData["firstName"] = $nameParts[0];
@@ -474,12 +505,11 @@ function extractContactData(int $contactId): array
             $contactData["lastName"] = $nameParts[1];
         }
 
-        // Извлекаем кастомные поля контакта
         $customFieldsValues = $contact["custom_fields_values"] ?? [];
         if (is_array($customFieldsValues)) {
             foreach ($customFieldsValues as $field) {
                 $fieldId = $field["field_id"] ?? null;
-                $value = $field["values"][0]["value"] ?? null;
+                $value   = $field["values"][0]["value"] ?? null;
 
                 if ($fieldId === AMO_CONTACT_FIELD_PHONE && $value !== null) {
                     $contactData["phone"] = $value;
@@ -494,7 +524,7 @@ function extractContactData(int $contactId): array
     } catch (Exception $e) {
         log_error("Ошибка при получении данных контакта", [
             'contact_id' => $contactId,
-            'error' => $e->getMessage()
+            'error'      => $e->getMessage()
         ], 'index.php');
         return [];
     }
@@ -504,29 +534,30 @@ function extractContactData(int $contactId): array
 // ФУНКЦИИ РАБОТЫ С HOLLYHOP
 // ============================================================================
 
-/**
- * Отправляет данные студента в Hollyhop
- */
 function sendStudentToHollyhop(array $studentData): ?array
 {
     $jsonData = json_encode($studentData, JSON_UNESCAPED_UNICODE);
     log_info("Данные подготовлены для отправки в Hollyhop", $studentData, 'index.php');
 
-    echo $jsonData . "<br><br>";
+    // В обычном режиме выводим для отладки, в payment_webhook режиме — нет
+    $isPaymentWebhook = isset($_GET['payment_webhook']) && $_GET['payment_webhook'] === '1';
+    if (!$isPaymentWebhook) {
+        echo $jsonData . "<br><br>";
+    }
 
     $url = 'https://srm.chinatutor.ru/add_student.php';
 
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL => $url,
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $jsonData,
-        CURLOPT_HTTPHEADER => [
+        CURLOPT_URL            => $url,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $jsonData,
+        CURLOPT_HTTPHEADER     => [
             'Content-Type: application/json',
             'Content-Length: ' . strlen($jsonData)
         ],
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => HOLLYHOP_TIMEOUT,
+        CURLOPT_TIMEOUT        => HOLLYHOP_TIMEOUT,
         CURLOPT_CONNECTTIMEOUT => HOLLYHOP_CONNECT_TIMEOUT,
         CURLOPT_SSL_VERIFYPEER => true,
     ]);
@@ -534,7 +565,7 @@ function sendStudentToHollyhop(array $studentData): ?array
     $startTime = microtime(true);
     log_info("Начало вызова add_student.php", ['url' => $url, 'timeout' => HOLLYHOP_TIMEOUT], 'index.php');
 
-    $response = curl_exec($ch);
+    $response      = curl_exec($ch);
     $executionTime = round(microtime(true) - $startTime, 2);
 
     log_info("Завершение вызова add_student.php", ['execution_time_seconds' => $executionTime], 'index.php');
@@ -545,20 +576,24 @@ function sendStudentToHollyhop(array $studentData): ?array
         $curlError = curl_error($ch);
         log_error("Ошибка cURL при отправке данных в Hollyhop", [
             'error' => $curlError,
-            'url' => $url
+            'url'   => $url
         ], 'index.php');
-        echo 'Ошибка cURL: ' . $curlError . "\n";
+        if (!$isPaymentWebhook) {
+            echo 'Ошибка cURL: ' . $curlError . "\n";
+        }
         curl_close($ch);
         return null;
     }
 
     log_info("Ответ от Hollyhop API получен", [
         'http_code' => $httpCode,
-        'response' => $response
+        'response'  => $response
     ], 'index.php');
 
-    echo "HTTP-код: $httpCode\n";
-    echo "Ответ сервера: " . ($response ?: 'пустой ответ') . "\n";
+    if (!$isPaymentWebhook) {
+        echo "HTTP-код: $httpCode\n";
+        echo "Ответ сервера: " . ($response ?: 'пустой ответ') . "\n";
+    }
 
     curl_close($ch);
 
@@ -574,9 +609,6 @@ function sendStudentToHollyhop(array $studentData): ?array
     return $result;
 }
 
-/**
- * Обрабатывает ответ от Hollyhop
- */
 function processHollyhopResponse(array $response, int $leadId, array $lead): void
 {
     $profileLink = $response["link"] ?? null;
@@ -584,13 +616,13 @@ function processHollyhopResponse(array $response, int $leadId, array $lead): voi
     if ($profileLink === null) {
         log_warning("Ссылка на профиль не получена в ответе", [
             'response' => $response,
-            'lead_id' => $leadId
+            'lead_id'  => $leadId
         ], 'index.php');
         return;
     }
 
     log_info("Ссылка на профиль студента получена", [
-        'link' => $profileLink,
+        'link'    => $profileLink,
         'lead_id' => $leadId
     ], 'index.php');
 
@@ -606,9 +638,6 @@ function processHollyhopResponse(array $response, int $leadId, array $lead): voi
     }
 }
 
-/**
- * Обновляет ссылку на профиль в AmoCRM
- */
 function updateLeadProfileLink(int $leadId, string $profileLink): void
 {
     global $subdomain, $data;
@@ -618,9 +647,7 @@ function updateLeadProfileLink(int $leadId, string $profileLink): void
         'custom_fields_values' => [
             [
                 'field_id' => AMO_FIELD_PROFILE_LINK,
-                'values' => [
-                    ['value' => $profileLink]
-                ]
+                'values'   => [['value' => $profileLink]]
             ]
         ]
     ];
@@ -636,19 +663,24 @@ function updateLeadProfileLink(int $leadId, string $profileLink): void
 
         log_info("Сделка в AmoCRM обновлена ссылкой на профиль", [
             'lead_id' => $leadId,
-            'link' => $profileLink
+            'link'    => $profileLink
         ], 'index.php');
 
-        echo print_r($amoRes, true);
+        $isPaymentWebhook = isset($_GET['payment_webhook']) && $_GET['payment_webhook'] === '1';
+        if (!$isPaymentWebhook) {
+            echo print_r($amoRes, true);
+        }
     } catch (Exception $e) {
         log_error("Ошибка при обновлении сделки в AmoCRM", [
             'lead_id' => $leadId,
-            'error' => $e->getMessage()
+            'error'   => $e->getMessage()
         ], 'index.php');
-        echo "Ошибка обновления: " . $e->getMessage();
+        $isPaymentWebhook = isset($_GET['payment_webhook']) && $_GET['payment_webhook'] === '1';
+        if (!$isPaymentWebhook) {
+            echo "Ошибка обновления: " . $e->getMessage();
+        }
     }
 }
-
 
 function extractContractLinkFromLead(array $lead): ?string
 {
@@ -660,71 +692,52 @@ function extractContractLinkFromLead(array $lead): ?string
     return null;
 }
 
-
-/**
- * Обновляет поле "Сделки АМО" и "Договор Оки" в Hollyhop
- */
 function updateHollyhopAmoDeal(int $clientId, int $leadId, array $lead): void
 {
     global $subdomain;
 
     $managerName = getManagerNameFromLead($lead);
-    $amoDealUrl = "https://{$subdomain}.amocrm.ru/leads/detail/{$leadId}";
+    $amoDealUrl  = "https://{$subdomain}.amocrm.ru/leads/detail/{$leadId}";
     $amoDealLink = buildHtmlLink($amoDealUrl, "{$managerName}: {$leadId}");
 
-    // 🔥 Получаем ссылку договора из сделки
     $contractLink = extractContractLinkFromLead($lead);
 
     try {
-        $apiConfig = get_config('api');
-        $authKey = $apiConfig['auth_key'];
+        $apiConfig  = get_config('api');
+        $authKey    = $apiConfig['auth_key'];
         $apiBaseUrl = $apiConfig['base_url'];
 
         $student = fetchStudentFromHollyhop($clientId, $authKey, $apiBaseUrl);
 
         if ($student === null) {
-            log_warning("Студент не найден в Hollyhop", [
-                'clientId' => $clientId
-            ], 'index.php');
+            log_warning("Студент не найден в Hollyhop", ['clientId' => $clientId], 'index.php');
             return;
         }
 
-        // === Обновляем поле "Сделки АМО" (как было)
         $allExtraFields = extractAllExtraFields($student, $amoDealLink);
 
-        // === 🔥 Добавляем/обновляем поле "Договор Оки"
         if (!empty($contractLink)) {
             $allExtraFields[] = [
                 'name'  => 'Договор Оки',
                 'value' => $contractLink
             ];
-
             log_info("Добавляем поле Договор Оки", [
-                'clientId' => $clientId,
+                'clientId'      => $clientId,
                 'contract_link' => $contractLink
             ], 'index.php');
         }
 
-        updateStudentExtraFields(
-            $clientId,
-            $allExtraFields,
-            $authKey,
-            $apiBaseUrl,
-            $leadId,
-            $amoDealLink
-        );
+        updateStudentExtraFields($clientId, $allExtraFields, $authKey, $apiBaseUrl, $leadId, $amoDealLink);
+
     } catch (Exception $e) {
         log_error("Ошибка при обновлении полей в Hollyhop", [
-            'error' => $e->getMessage(),
+            'error'    => $e->getMessage(),
             'clientId' => $clientId,
-            'lead_id' => $leadId
+            'lead_id'  => $leadId
         ], 'index.php');
     }
 }
 
-/**
- * Получает имя менеджера из данных сделки
- */
 function getManagerNameFromLead(array $lead): string
 {
     global $subdomain, $data;
@@ -739,68 +752,48 @@ function getManagerNameFromLead(array $lead): string
     }
 
     try {
-        $user = get($subdomain, "/api/v4/users/{$responsibleUserId}", $data);
-
+        $user        = get($subdomain, "/api/v4/users/{$responsibleUserId}", $data);
         $managerName = extractManagerNameFromResponse($user);
 
         log_info("Имя менеджера получено из AmoCRM", [
             'responsible_user_id' => $responsibleUserId,
-            'manager_name' => $managerName,
-            'user_response_structure' => is_array($user) ? 'array' : 'object'
+            'manager_name'        => $managerName
         ], 'index.php');
 
         return $managerName;
     } catch (Exception $e) {
         log_warning("Не удалось получить имя менеджера из AmoCRM", [
             'responsible_user_id' => $responsibleUserId,
-            'error' => $e->getMessage()
+            'error'               => $e->getMessage()
         ], 'index.php');
         return 'Неизвестно';
     }
 }
 
-/**
- * Извлекает имя менеджера из ответа API
- */
 function extractManagerNameFromResponse(array $user): string
 {
-    if (isset($user["name"])) {
-        return $user["name"];
-    }
-
-    if (isset($user[0]["name"])) {
-        return $user[0]["name"];
-    }
+    if (isset($user["name"])) return $user["name"];
+    if (isset($user[0]["name"])) return $user[0]["name"];
 
     if (is_array($user) && !empty($user)) {
         $firstUser = reset($user);
-        if (isset($firstUser["name"])) {
-            return $firstUser["name"];
-        }
+        if (isset($firstUser["name"])) return $firstUser["name"];
     }
 
     return 'Неизвестно';
 }
 
-/**
- * Формирует HTML-ссылку
- */
 function buildHtmlLink(string $url, string $text): string
 {
-    $safeUrl = htmlspecialchars($url, ENT_QUOTES, 'UTF-8');
+    $safeUrl  = htmlspecialchars($url, ENT_QUOTES, 'UTF-8');
     $safeText = htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
     return "<a href=\"{$safeUrl}\" target=\"_blank\">{$safeText}</a>";
 }
 
-/**
- * Получает данные студента из Hollyhop
- */
 function fetchStudentFromHollyhop(int $clientId, string $authKey, string $apiBaseUrl): ?array
 {
-    $getStudentParams = ['clientId' => $clientId];
-    $studentData = callHollyhopApi('GetStudents', $getStudentParams, $authKey, $apiBaseUrl);
+    $studentData = callHollyhopApi('GetStudents', ['clientId' => $clientId], $authKey, $apiBaseUrl);
 
-    // Извлекаем студента из ответа
     if (isset($studentData['ClientId']) || isset($studentData['clientId'])) {
         return $studentData;
     }
@@ -820,141 +813,80 @@ function fetchStudentFromHollyhop(int $clientId, string $authKey, string $apiBas
     return null;
 }
 
-/**
- * Извлекает все ExtraFields и обновляет поле "Сделки АМО"
- */
 function extractAllExtraFields(array $student, string $newAmoDealLink): array
 {
-    $allExtraFields = [];
+    $allExtraFields  = [];
     $currentAmoDeals = '';
-    $amoDealsfieldFound = false;
+    $fieldFound      = false;
 
-    log_info("Начало обработки ExtraFields для обновления поля 'Сделки АМО'", [
-        'clientId' => $student['ClientId'] ?? $student['clientId'] ?? 'unknown',
-        'has_ExtraFields' => isset($student['ExtraFields']),
-        'ExtraFields_count' => isset($student['ExtraFields']) && is_array($student['ExtraFields'])
-            ? count($student['ExtraFields'])
-            : 0
+    log_info("Начало обработки ExtraFields", [
+        'clientId'         => $student['ClientId'] ?? $student['clientId'] ?? 'unknown',
+        'ExtraFields_count' => count($student['ExtraFields'] ?? [])
     ], 'index.php');
 
-    $extraFields = $student['ExtraFields'] ?? [];
-
-    if (!is_array($extraFields)) {
-        log_warning("ExtraFields не является массивом", [
-            'ExtraFields_type' => gettype($extraFields)
-        ], 'index.php');
-        $extraFields = [];
-    }
-
-    foreach ($extraFields as $field) {
-        $fieldName = $field['Name'] ?? $field['name'] ?? '';
+    foreach ($student['ExtraFields'] ?? [] as $field) {
+        $fieldName  = $field['Name'] ?? $field['name'] ?? '';
         $fieldValue = $field['Value'] ?? $field['value'] ?? '';
 
         if (isAmoDealField($fieldName)) {
             $currentAmoDeals = $fieldValue;
-            $amoDealsfieldFound = true;
-
-            log_info("Найдено поле 'Сделки АМО'", [
-                'field_name' => $fieldName,
-                'current_value_length' => strlen($fieldValue)
-            ], 'index.php');
+            $fieldFound      = true;
         } else {
-            $allExtraFields[] = [
-                'name' => $fieldName,
-                'value' => $fieldValue
-            ];
+            $allExtraFields[] = ['name' => $fieldName, 'value' => $fieldValue];
         }
     }
 
-    if (!$amoDealsfieldFound) {
-        log_warning("Поле 'Сделки АМО' не найдено в ExtraFields", [
-            'available_fields' => array_map(fn($f) => $f['name'] ?? 'unknown', $allExtraFields)
-        ], 'index.php');
+    if (!$fieldFound) {
+        log_warning("Поле 'Сделки АМО' не найдено в ExtraFields", [], 'index.php');
     }
 
     $newAmoDealsValue = mergeAmoDealLinks($currentAmoDeals, $newAmoDealLink);
 
     $allExtraFields[] = [
-        'name' => AMO_DEALS_FIELD_NAME,
+        'name'  => AMO_DEALS_FIELD_NAME,
         'value' => $newAmoDealsValue
     ];
 
     return $allExtraFields;
 }
 
-/**
- * Проверяет, является ли поле полем "Сделки АМО"
- */
 function isAmoDealField(string $fieldName): bool
 {
     $normalizedName = trim($fieldName);
-    $lowerName = mb_strtolower($normalizedName, 'UTF-8');
+    $lowerName      = mb_strtolower($normalizedName, 'UTF-8');
 
-    $exactMatches = ['Сделки АМО', 'Ссылки АМО'];
-    if (in_array($normalizedName, $exactMatches, true)) {
+    if (in_array($normalizedName, ['Сделки АМО', 'Ссылки АМО'], true)) {
         return true;
     }
 
     $containsSdelki = mb_stripos($lowerName, 'сделки', 0, 'UTF-8') !== false;
     $containsSsilki = mb_stripos($lowerName, 'ссылки', 0, 'UTF-8') !== false;
-    $containsAmo = mb_stripos($lowerName, 'амо', 0, 'UTF-8') !== false ||
-        mb_stripos($lowerName, 'amo', 0, 'UTF-8') !== false;
+    $containsAmo    = mb_stripos($lowerName, 'амо', 0, 'UTF-8') !== false ||
+                      mb_stripos($lowerName, 'amo', 0, 'UTF-8') !== false;
 
     return ($containsSdelki || $containsSsilki) && $containsAmo;
 }
 
-/**
- * Объединяет существующие ссылки с новой ссылкой
- */
 function mergeAmoDealLinks(string $currentLinks, string $newLink): string
 {
     $currentLinksClean = trim($currentLinks);
 
-    // Извлекаем URL из новой ссылки
     preg_match('/href=["\']([^"\']+)["\']/', $newLink, $newLinkMatches);
     $newLinkUrl = $newLinkMatches[1] ?? '';
 
-    log_info("Обработка текущего значения поля 'Сделки АМО'", [
-        'original_value_preview' => substr($currentLinks, 0, 200),
-        'new_link_to_add' => $newLink,
-        'new_link_url' => $newLinkUrl
-    ], 'index.php');
-
-    // Разбиваем существующие ссылки
     $existingLinks = parseExistingLinks($currentLinksClean);
 
-    log_info("Разбор существующих ссылок", [
-        'existing_links_count' => count($existingLinks),
-        'new_link_url' => $newLinkUrl
-    ], 'index.php');
-
-    // Проверяем наличие дубликата
     if (linkExists($existingLinks, $newLinkUrl)) {
-        log_info("Ссылка уже существует в поле, оставляем без изменений", [
-            'final_value_preview' => substr(implode("<br>", $existingLinks), 0, 200)
-        ], 'index.php');
         return implode("<br>", $existingLinks);
     }
 
-    // Добавляем новую ссылку
     $existingLinks[] = $newLink;
-
-    log_info("Добавлена новая ссылка к существующим", [
-        'final_value_preview' => substr(implode("<br>", $existingLinks), 0, 200),
-        'total_links' => count($existingLinks)
-    ], 'index.php');
-
     return implode("<br>", $existingLinks);
 }
 
-/**
- * Разбирает строку со ссылками на отдельные элементы
- */
 function parseExistingLinks(string $linksString): array
 {
-    if (empty($linksString)) {
-        return [];
-    }
+    if (empty($linksString)) return [];
 
     $parts = preg_split('/<br\s*\/?>|\s*\r?\n\s*|\s{2,}/i', $linksString);
     $links = [];
@@ -969,22 +901,13 @@ function parseExistingLinks(string $linksString): array
     return $links;
 }
 
-/**
- * Проверяет, существует ли ссылка в списке
- */
 function linkExists(array $existingLinks, string $newUrl): bool
 {
     $newUrlNormalized = normalizeUrl($newUrl);
 
     foreach ($existingLinks as $existingLink) {
         $existingUrl = extractUrlFromLink($existingLink);
-        $existingUrlNormalized = normalizeUrl($existingUrl);
-
-        if ($existingUrlNormalized === $newUrlNormalized) {
-            log_info("Ссылка уже существует в поле", [
-                'existing_url' => $existingUrl,
-                'new_url' => $newUrl
-            ], 'index.php');
+        if (normalizeUrl($existingUrl) === $newUrlNormalized) {
             return true;
         }
     }
@@ -992,9 +915,6 @@ function linkExists(array $existingLinks, string $newUrl): bool
     return false;
 }
 
-/**
- * Извлекает URL из HTML-ссылки или возвращает саму строку
- */
 function extractUrlFromLink(string $link): string
 {
     if (preg_match('/href=["\']([^"\']+)["\']/', $link, $matches)) {
@@ -1003,17 +923,11 @@ function extractUrlFromLink(string $link): string
     return $link;
 }
 
-/**
- * Нормализует URL для сравнения
- */
 function normalizeUrl(string $url): string
 {
     return rtrim(strtolower($url), '/');
 }
 
-/**
- * Обновляет ExtraFields студента в Hollyhop
- */
 function updateStudentExtraFields(
     int $clientId,
     array $allExtraFields,
@@ -1022,77 +936,56 @@ function updateStudentExtraFields(
     int $leadId,
     string $amoDealLink
 ): void {
-    log_info("Подготовка к обновлению через EditUserExtraFields", [
-        'clientId' => $clientId,
-        'total_fields_to_send' => count($allExtraFields),
+    log_info("Отправка запроса EditUserExtraFields", [
+        'studentClientId'  => $clientId,
+        'fields_count'     => count($allExtraFields),
         'all_fields_names' => array_map(fn($f) => $f['name'] ?? 'unknown', $allExtraFields)
     ], 'index.php');
 
     try {
         $updateParams = [
             'studentClientId' => $clientId,
-            'fields' => $allExtraFields
+            'fields'          => $allExtraFields
         ];
-
-        log_info("Отправка запроса EditUserExtraFields", [
-            'studentClientId' => $clientId,
-            'fields_count' => count($allExtraFields),
-            'amo_deals_in_fields' => in_array(
-                AMO_DEALS_FIELD_NAME,
-                array_map(fn($f) => $f['name'] ?? '', $allExtraFields)
-            )
-        ], 'index.php');
 
         $updateResult = callHollyhopApi('EditUserExtraFields', $updateParams, $authKey, $apiBaseUrl);
 
         log_info("EditUserExtraFields выполнен успешно", [
-            'result_preview' => is_array($updateResult)
-                ? json_encode($updateResult, JSON_UNESCAPED_UNICODE)
-                : (string)$updateResult
+            'clientId' => $clientId,
+            'lead_id'  => $leadId
         ], 'index.php');
 
-        log_info("Поле 'Сделки АМО' обновлено в Hollyhop", [
-            'clientId' => $clientId,
-            'lead_id' => $leadId,
-            'amo_deal_link' => $amoDealLink,
-            'method' => 'EditUserExtraFields',
-            'total_fields_updated' => count($allExtraFields)
-        ], 'index.php');
     } catch (Exception $e) {
         log_warning("Не удалось обновить через EditUserExtraFields", [
-            'error' => substr($e->getMessage(), 0, 200),
-            'fields_count' => count($allExtraFields),
-            'full_error' => $e->getMessage()
+            'error'    => $e->getMessage(),
+            'clientId' => $clientId
         ], 'index.php');
     }
 }
 
-/**
- * Вызывает метод Hollyhop API
- */
 function callHollyhopApi(string $functionName, array $params, string $authKey, string $apiBaseUrl): array
 {
-    $url = $apiBaseUrl . '/' . $functionName;
+    $url      = $apiBaseUrl . '/' . $functionName;
     $params['authkey'] = $authKey;
     $postData = json_encode($params);
 
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL => $url,
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $postData,
-        CURLOPT_HTTPHEADER => [
+        CURLOPT_URL            => $url,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $postData,
+        CURLOPT_HTTPHEADER     => [
             'Content-Type: application/json',
             'Content-Length: ' . strlen($postData)
         ],
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => HOLLYHOP_API_TIMEOUT,
+        CURLOPT_TIMEOUT        => HOLLYHOP_API_TIMEOUT,
         CURLOPT_CONNECTTIMEOUT => HOLLYHOP_CONNECT_TIMEOUT,
         CURLOPT_SSL_VERIFYPEER => true,
     ]);
 
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $response  = curl_exec($ch);
+    $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $curlError = curl_error($ch);
     curl_close($ch);
 

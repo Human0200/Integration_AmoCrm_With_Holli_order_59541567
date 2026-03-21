@@ -49,7 +49,9 @@ require_once __DIR__ . '/config.php';
 const AMO_FIELD_PROFILE_LINK = 1630807;
 const AMO_CONTACT_FIELD_PHONE = 1138327;
 const AMO_CONTACT_FIELD_EMAIL = 1138329;
-const ADD_STUDENT_ENDPOINT = 'https://srm.chinatutor.ru/add_student.php';
+
+// Используем index.php — он содержит полную логику поиска и создания студента
+const INDEX_ENDPOINT = 'https://srm.chinatutor.ru/index.php?payment_webhook=1';
 
 /**
  * Функции логирования для add_payment.php (запись в отдельный файл pay.log)
@@ -59,16 +61,13 @@ function log_payment_message($message, $data = null, $level = 'INFO')
     $log_dir = __DIR__ . '/logs';
     $log_file = $log_dir . '/pay.log';
 
-    // Создаём директорию для логов, если её нет
     if (!is_dir($log_dir)) {
         @mkdir($log_dir, 0755, true);
     }
 
-    // Форматируем сообщение
     $timestamp = date('Y-m-d H:i:s');
     $log_entry = "[{$timestamp}] [{$level}] {$message}";
 
-    // Добавляем дополнительные данные
     if ($data !== null) {
         if (is_string($data)) {
             $log_entry .= "\n" . $data;
@@ -79,7 +78,6 @@ function log_payment_message($message, $data = null, $level = 'INFO')
 
     $log_entry .= "\n" . str_repeat('-', 80) . "\n";
 
-    // Записываем в файл
     @file_put_contents($log_file, $log_entry, FILE_APPEND | LOCK_EX);
 }
 
@@ -137,13 +135,9 @@ function call_hollyhop_api($function_name, $params, $auth_key, $api_base_url)
 {
     $url = $api_base_url . '/' . $function_name;
 
-    // Добавляем authkey
     $params['authkey'] = $auth_key;
-
-    // Подготавливаем данные для отправки
     $post_data = json_encode($params);
 
-    // Инициализируем cURL
     $ch = curl_init();
 
     curl_setopt_array($ch, [
@@ -164,8 +158,6 @@ function call_hollyhop_api($function_name, $params, $auth_key, $api_base_url)
     $curl_error = curl_error($ch);
 
     curl_close($ch);
-
-    // Логирование запроса (только при ошибках)
 
     if ($curl_error) {
         log_payment_error("cURL ошибка: {$curl_error}", ['function' => $function_name]);
@@ -188,8 +180,6 @@ function call_hollyhop_api($function_name, $params, $auth_key, $api_base_url)
         ]);
         throw new Exception("Некорректный ответ от API. Raw response: " . substr($response, 0, 500));
     }
-
-    // Успешный ответ (логируем только при ошибках)
 
     return $result;
 }
@@ -236,239 +226,133 @@ function update_lead_profile_link_in_amocrm(int $lead_id, string $profile_link, 
 }
 
 /**
- * Получает данные первого контакта сделки для payload add_student.php.
+ * Вызывает index.php передавая lead_id в формате вебхука AmoCRM (leads add).
+ * index.php содержит полную логику поиска существующего студента и создания нового.
+ * После вызова index.php ищем студента в Hollyhop по телефону/email контакта сделки,
+ * либо по ссылке на профиль в сделке AmoCRM.
  */
-function extract_contact_data_from_lead(int $lead_id, array $lead, string $subdomain, array $data): array
+function call_index_for_student(int $lead_id, array $lead, string $subdomain, array $amo_data, string $auth_key, string $api_base_url): array
 {
-    $result = [
-        'firstName' => null,
-        'lastName' => null,
-        'phone' => null,
-        'email' => null
-    ];
+    log_payment_info("Вызов index.php для создания/поиска студента", ['lead_id' => $lead_id]);
 
-    $contact_id = $lead['_embedded']['contacts'][0]['id'] ?? null;
-
-    if (!$contact_id) {
-        try {
-            $lead_with_contacts = get($subdomain, "/api/v4/leads/{$lead_id}?with=contacts", $data);
-            $contact_id = $lead_with_contacts['_embedded']['contacts'][0]['id'] ?? null;
-        } catch (Exception $e) {
-            log_payment_warning("Не удалось получить контакты сделки для ensure student", [
-                'lead_id' => $lead_id,
-                'error' => $e->getMessage()
-            ]);
-            return $result;
-        }
-    }
-
-    if (!$contact_id) {
-        return $result;
-    }
-
-    try {
-        $contact = get($subdomain, "/api/v4/contacts/{$contact_id}", $data);
-    } catch (Exception $e) {
-        log_payment_warning("Не удалось получить контакт для ensure student", [
-            'lead_id' => $lead_id,
-            'contact_id' => $contact_id,
-            'error' => $e->getMessage()
-        ]);
-        return $result;
-    }
-
-    $contact_name = trim((string) ($contact['name'] ?? ''));
-    if ($contact_name !== '') {
-        $name_parts = preg_split('/\s+/u', $contact_name);
-        if (!empty($name_parts[0])) {
-            $result['firstName'] = $name_parts[0];
-        }
-        if (!empty($name_parts[1])) {
-            $result['lastName'] = $name_parts[1];
-        }
-    }
-
-    $contact_fields = $contact['custom_fields_values'] ?? [];
-    foreach ($contact_fields as $field) {
-        $field_id = $field['field_id'] ?? null;
-        $field_value = $field['values'][0]['value'] ?? null;
-        if ($field_value === null || $field_value === '') {
-            continue;
-        }
-
-        if ($field_id == AMO_CONTACT_FIELD_PHONE && empty($result['phone'])) {
-            $result['phone'] = trim((string) $field_value);
-        } elseif ($field_id == AMO_CONTACT_FIELD_EMAIL && empty($result['email'])) {
-            $result['email'] = trim((string) $field_value);
-        }
-    }
-
-    return $result;
-}
-
-/**
- * Формирует payload для add_student.php из данных сделки и контакта.
- */
-function build_student_payload_for_add_student(int $lead_id, array $lead, string $subdomain, array $data): array
-{
-    $payload = [
-        'Status' => 'В наборе',
-        'gender' => 'F',
-        'link' => "https://{$subdomain}.amocrm.ru/leads/detail/{$lead_id}",
-        'amo_lead_id' => $lead_id,
-        'amo_subdomain' => $subdomain
-    ];
-
-    $lead_field_map = [
-        1575217 => 'discipline',
-        1576357 => 'level',
-        1575221 => 'learningType',
-        1575213 => 'maturity',
-        1596219 => 'officeOrCompanyId',
-        1590693 => 'responsible_user'
-    ];
-
-    foreach ($lead['custom_fields_values'] ?? [] as $field) {
-        $field_id = $field['field_id'] ?? null;
-        $value = $field['values'][0]['value'] ?? null;
-
-        if ($field_id === null || $value === null || $value === '') {
-            continue;
-        }
-
-        if (isset($lead_field_map[$field_id])) {
-            $payload[$lead_field_map[$field_id]] = $value;
-        }
-    }
-
-    $contact_data = extract_contact_data_from_lead($lead_id, $lead, $subdomain, $data);
-    if (!empty($contact_data['firstName'])) {
-        $payload['firstName'] = $contact_data['firstName'];
-    }
-    if (!empty($contact_data['lastName'])) {
-        $payload['lastName'] = $contact_data['lastName'];
-    }
-    if (!empty($contact_data['phone'])) {
-        $payload['phone'] = $contact_data['phone'];
-    }
-    if (!empty($contact_data['email'])) {
-        $payload['email'] = $contact_data['email'];
-    }
-
-    if (empty($payload['firstName'])) {
-        $payload['firstName'] = '-';
-    }
-    if (empty($payload['lastName'])) {
-        $payload['lastName'] = '-';
-    }
-
-    return $payload;
-}
-
-/**
- * Вызывает основной скрипт add_student.php.
- */
-function call_add_student_script(array $payload): array
-{
-    $json_data = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    if ($json_data === false) {
-        throw new Exception("Не удалось закодировать payload для add_student.php");
-    }
+    // Отправляем вебхук в формате AmoCRM leads add
+    $post_fields = http_build_query([
+        'leads' => [
+            'add' => [
+                0 => ['id' => $lead_id]
+            ]
+        ]
+    ]);
 
     $ch = curl_init();
     curl_setopt_array($ch, [
-        CURLOPT_URL => ADD_STUDENT_ENDPOINT,
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $json_data,
-        CURLOPT_HTTPHEADER => [
-            'Content-Type: application/json',
-            'Content-Length: ' . strlen($json_data)
-        ],
+        CURLOPT_URL            => INDEX_ENDPOINT,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $post_fields,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 120,
+        CURLOPT_TIMEOUT        => 120,
         CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_SSL_VERIFYPEER => true,
     ]);
 
-    $response = curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $response   = curl_exec($ch);
+    $http_code  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $curl_error = curl_error($ch);
     curl_close($ch);
 
     if ($curl_error) {
-        throw new Exception("Ошибка вызова add_student.php: {$curl_error}");
+        throw new Exception("Ошибка вызова index.php: {$curl_error}");
     }
 
     if ($http_code >= 400) {
-        throw new Exception("add_student.php вернул HTTP {$http_code}: " . substr((string) $response, 0, 500));
+        throw new Exception("index.php вернул HTTP {$http_code}: " . substr((string) $response, 0, 500));
     }
 
-    $decoded = json_decode(trim((string) $response), true);
-    if (!is_array($decoded)) {
-        throw new Exception("Некорректный JSON от add_student.php");
-    }
-
-    if (isset($decoded['success']) && $decoded['success'] === false) {
-        $error_text = $decoded['error'] ?? 'Неизвестная ошибка add_student.php';
-        throw new Exception("add_student.php: {$error_text}");
-    }
-
-    return $decoded;
-}
-
-/**
- * Обеспечивает наличие карточки ученика в Hollyhop до отправки оплаты.
- */
-function ensure_student_card_for_payment(int $lead_id, array $lead, string $subdomain, array $data): array
-{
-    $payload = build_student_payload_for_add_student($lead_id, $lead, $subdomain, $data);
-
-    log_payment_info("clientId не найден. Запускаем add_student.php перед AddPayment", [
-        'lead_id' => $lead_id,
-        'has_phone' => !empty($payload['phone']),
-        'has_email' => !empty($payload['email'])
+    log_payment_info("index.php вызван, ответ получен", [
+        'lead_id'   => $lead_id,
+        'http_code' => $http_code,
+        'response_preview' => substr((string) $response, 0, 300)
     ]);
 
-    $response = call_add_student_script($payload);
+    // index.php не возвращает чистый JSON (содержит echo для отладки),
+    // поэтому после его выполнения читаем профиль студента из обновлённой сделки AmoCRM.
+    // index.php записывает ссылку на профиль в поле AMO_FIELD_PROFILE_LINK сделки.
 
-    $client_id = $response['clientId'] ?? $response['ClientId'] ?? null;
-    if (!$client_id) {
-        $fallback_profile_id = $response['Id'] ?? $response['id'] ?? null;
-        if ($fallback_profile_id) {
-            $client_id = $fallback_profile_id;
+    // Небольшая пауза чтобы index.php успел записать данные
+    sleep(2);
+
+    // Перечитываем сделку — index.php должен был записать ссылку на профиль
+    $updated_lead = get($subdomain, '/api/v4/leads/' . $lead_id, $amo_data);
+
+    $profile_link     = null;
+    $resolved_profile_id = null;
+
+    foreach ($updated_lead['custom_fields_values'] ?? [] as $field) {
+        if (($field['field_id'] ?? null) == AMO_FIELD_PROFILE_LINK && !empty($field['values'][0]['value'])) {
+            $profile_link = trim((string) $field['values'][0]['value']);
+            if (preg_match('/\/Profile\/(\d+)/', $profile_link, $matches)) {
+                $resolved_profile_id = (int) $matches[1];
+            }
+            break;
         }
     }
 
-    if (!$client_id) {
-        throw new Exception("add_student.php не вернул clientId");
+    if (!$profile_link) {
+        log_payment_warning("После вызова index.php ссылка на профиль в сделке не появилась", [
+            'lead_id' => $lead_id
+        ]);
+        throw new Exception("index.php не записал ссылку на профиль в сделку {$lead_id}");
     }
 
-    $profile_link = isset($response['link']) ? trim((string) $response['link']) : null;
-    if ($profile_link === '') {
-        $profile_link = null;
-    }
+    log_payment_info("Ссылка на профиль найдена после index.php", [
+        'lead_id'    => $lead_id,
+        'profile_link' => $profile_link,
+        'profile_id' => $resolved_profile_id
+    ]);
 
-    if ($profile_link) {
+    // Получаем clientId из Hollyhop по profile_id
+    $client_id = null;
+    if ($resolved_profile_id) {
         try {
-            update_lead_profile_link_in_amocrm($lead_id, $profile_link, $subdomain, $data);
-            log_payment_info("Ссылка на профиль обновлена в сделке после add_student.php", [
-                'lead_id' => $lead_id,
-                'profile_link' => $profile_link
-            ]);
+            $api_response = call_hollyhop_api('GetStudents', ['Id' => $resolved_profile_id], $auth_key, $api_base_url);
+
+            $student_info = null;
+            if (is_array($api_response)) {
+                if (isset($api_response['ClientId']) || isset($api_response['clientId'])) {
+                    $student_info = $api_response;
+                } elseif (isset($api_response['Students']) && is_array($api_response['Students'])) {
+                    foreach ($api_response['Students'] as $student) {
+                        if (is_array($student) && (($student['Id'] ?? $student['id'] ?? null) == $resolved_profile_id)) {
+                            $student_info = $student;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if ($student_info) {
+                $client_id = $student_info['ClientId'] ?? $student_info['clientId'] ?? null;
+                log_payment_info("clientId получен из Hollyhop по profile_id", [
+                    'profile_id' => $resolved_profile_id,
+                    'clientId'   => $client_id
+                ]);
+            }
         } catch (Exception $e) {
-            log_payment_warning("Не удалось обновить ссылку на профиль в сделке после add_student.php", [
-                'lead_id' => $lead_id,
-                'profile_link' => $profile_link,
-                'error' => $e->getMessage()
+            log_payment_warning("Не удалось получить clientId по profile_id после index.php", [
+                'profile_id' => $resolved_profile_id,
+                'error'      => $e->getMessage()
             ]);
         }
+    }
+
+    if (!$client_id) {
+        throw new Exception("Не удалось получить clientId после вызова index.php для сделки {$lead_id}");
     }
 
     return [
-        'client_id' => $client_id,
+        'client_id'    => $client_id,
         'profile_link' => $profile_link,
-        'profile_id' => $response['Id'] ?? $response['id'] ?? null,
-        'response' => $response
+        'profile_id'   => $resolved_profile_id,
     ];
 }
 
@@ -476,15 +360,14 @@ function ensure_student_card_for_payment(int $lead_id, array $lead, string $subd
  * Основная логика скрипта
  */
 try {
-    // Извлекаем ID транзакции, сделки или счета из вебхука
-    $transaction_id = null;
+    $transaction_id      = null;
     $lead_id_from_webhook = null;
-    $catalog_element_id = null;
-    $catalog_id = null;
-    $event_type = null;
-    $payment_link = null; // Ссылка на оплату (INVOICE_HASH_LINK) - для определения способа оплаты
+    $catalog_element_id  = null;
+    $catalog_id          = null;
+    $event_type          = null;
+    $payment_link        = null;
 
-    // Сначала проверяем, есть ли транзакция в вебхуке
+    // Определяем тип вебхука
     if (isset($_POST["transactions"]["add"][0]["id"])) {
         $transaction_id = (int) $_POST["transactions"]["add"][0]["id"];
         $event_type = 'transaction_add';
@@ -493,9 +376,7 @@ try {
         $transaction_id = (int) $_POST["transactions"]["status"][0]["id"];
         $event_type = 'transaction_status';
         log_payment_info("Вебхук: статус транзакции изменен", ['transaction_id' => $transaction_id]);
-    }
-    // Если транзакции нет, проверяем, есть ли сделка
-    elseif (isset($_POST["leads"]["add"][0]["id"])) {
+    } elseif (isset($_POST["leads"]["add"][0]["id"])) {
         $lead_id_from_webhook = (int) $_POST["leads"]["add"][0]["id"];
         $event_type = 'lead_add';
         log_payment_info("Вебхук: сделка создана", ['lead_id' => $lead_id_from_webhook]);
@@ -503,9 +384,7 @@ try {
         $lead_id_from_webhook = (int) $_POST["leads"]["status"][0]["id"];
         $event_type = 'lead_status';
         log_payment_info("Вебхук: статус сделки изменен", ['lead_id' => $lead_id_from_webhook]);
-    }
-    // Проверяем, есть ли счет (каталог)
-    elseif (isset($_POST["catalogs"]["update"][0]["id"])) {
+    } elseif (isset($_POST["catalogs"]["update"][0]["id"])) {
         $catalog_element_id = (int) $_POST["catalogs"]["update"][0]["id"];
         $catalog_id = isset($_POST["catalogs"]["update"][0]["catalog_id"])
             ? (int) $_POST["catalogs"]["update"][0]["catalog_id"]
@@ -529,56 +408,49 @@ try {
         exit;
     }
 
-    // Если получен вебхук от счета (каталога), обрабатываем его
+    // =========================================================================
+    // ОБРАБОТКА СЧЁТА (каталог)
+    // =========================================================================
     if ($catalog_element_id && $catalog_id) {
 
         try {
-            // Извлекаем данные из вебхука
             $catalog_data = $_POST["catalogs"]["update"][0] ?? $_POST["catalogs"]["add"][0] ?? null;
 
             if (!$catalog_data) {
                 throw new Exception("Не удалось извлечь данные счета из вебхука");
             }
 
-            // Извлекаем данные из кастомных полей счета
-            $custom_fields = $catalog_data['custom_fields'] ?? [];
-            $bill_status = null;
-            $bill_price = null;
+            $custom_fields     = $catalog_data['custom_fields'] ?? [];
+            $bill_status       = null;
+            $bill_price        = null;
             $bill_payment_date = null;
-            // $payment_link уже инициализирована в начале скрипта
 
             foreach ($custom_fields as $field) {
-                $code = $field['code'] ?? null;
+                $code     = $field['code'] ?? null;
                 $field_id = $field['id'] ?? null;
-                $values = $field['values'] ?? [];
+                $values   = $field['values'] ?? [];
 
                 if ($code === 'BILL_STATUS') {
                     $bill_status = is_array($values[0]) ? ($values[0]['value'] ?? null) : ($values[0] ?? null);
                 } elseif ($code === 'BILL_PRICE') {
                     $bill_price = is_array($values[0]) ? ($values[0]['value'] ?? null) : ($values[0] ?? null);
                 } elseif ($code === 'BILL_PAYMENT_DATE') {
-                    // Дата может быть массивом значений или объектом
                     if (is_array($values[0])) {
                         $bill_payment_date = $values[0]['value'] ?? $values[0][0] ?? null;
                     } else {
                         $bill_payment_date = $values[0] ?? null;
                     }
-                    // Если это массив значений напрямую (как в вашем случае)
                     if (is_array($values) && count($values) > 0 && !is_array($values[0])) {
                         $bill_payment_date = $values[0];
                     }
                 } elseif ($code === 'INVOICE_HASH_LINK' || $field_id == 1622603 || $field_id == 1630781) {
-                    // Ссылка на оплату (проверяем по code INVOICE_HASH_LINK или по field_id 1622603, 1630781)
                     $payment_link_raw = is_array($values[0]) ? ($values[0]['value'] ?? null) : ($values[0] ?? null);
                     $payment_link = $payment_link_raw ? trim($payment_link_raw) : null;
-                    // Если после trim получилась пустая строка, считаем как null
                     if ($payment_link === '') {
                         $payment_link = null;
                     }
                 }
 
-                // Останавливаемся, если все обязательные поля найдены
-                // payment_link необязательно - может быть пустым (тогда будет ПСБ)
                 if ($bill_status && $bill_price && $bill_payment_date) {
                     break;
                 }
@@ -608,82 +480,55 @@ try {
             // Ищем связанную сделку через массовый API links
             $lead_id_from_catalog = null;
 
-            // Поиск через связанные сущности (links)
-            // Используем поиск через не закрытые сделки, созданные за последние 6 месяцев
-            // Проверяем сделки по мере получения (оптимизация - не ждем сбора всех)
             try {
-                // Вычисляем дату 6 месяцев назад (в Unix timestamp)
-                $six_months_ago = time() - (6 * 30 * 24 * 60 * 60); // 6 месяцев назад (примерно 180 дней)
-                $six_months_ago_timestamp = $six_months_ago;
-
-                // Размер пула для получения сделок
-                $leads_pool_size = 250; // Максимум 250 сделок за один запрос
+                $six_months_ago = time() - (6 * 30 * 24 * 60 * 60);
+                $leads_pool_size = 250;
                 $page = 1;
                 $total_processed = 0;
                 $total_checked = 0;
 
-                // Получаем сделки по фильтру, разбивая на пулы, и проверяем по мере получения
                 do {
-                    $api_url = "/api/v4/leads?limit={$leads_pool_size}&page={$page}&filter[created_at][from]={$six_months_ago_timestamp}&order[created_at]=desc";
-
+                    $api_url = "/api/v4/leads?limit={$leads_pool_size}&page={$page}&filter[created_at][from]={$six_months_ago}&order[created_at]=desc";
                     $LEADS_RESPONSE = get($subdomain, $api_url, $data);
 
-                    if (!isset($LEADS_RESPONSE['_embedded']['leads']) || !is_array($LEADS_RESPONSE['_embedded']['leads']) || empty($LEADS_RESPONSE['_embedded']['leads'])) {
-                        break; // Нет больше сделок
+                    if (!isset($LEADS_RESPONSE['_embedded']['leads']) || empty($LEADS_RESPONSE['_embedded']['leads'])) {
+                        break;
                     }
 
                     $leads_in_page = count($LEADS_RESPONSE['_embedded']['leads']);
                     $total_processed += $leads_in_page;
 
-                    // Фильтруем только не закрытые сделки
-                    // В AmoCRM закрытые сделки имеют поле closed_at (timestamp закрытия)
                     $open_leads = array_filter($LEADS_RESPONSE['_embedded']['leads'], function ($lead) {
-                        $closed_at = $lead['closed_at'] ?? null;
-                        // Если closed_at пустое или null, сделка не закрыта
-                        return empty($closed_at);
+                        return empty($lead['closed_at'] ?? null);
                     });
 
-                    $page_lead_ids = array_map(function ($lead) {
-                        return $lead['id'] ?? null;
-                    }, $open_leads);
-                    $page_lead_ids = array_filter($page_lead_ids);
+                    $page_lead_ids = array_filter(array_map(fn($l) => $l['id'] ?? null, $open_leads));
 
-                    // Сразу проверяем не закрытые сделки из этого пула
                     if (!empty($page_lead_ids)) {
-                        // Разбиваем на части по 50 сделок для массового API links
-                        $chunk_size = 50;
-                        $lead_chunks = array_chunk($page_lead_ids, $chunk_size);
+                        $lead_chunks = array_chunk($page_lead_ids, 50);
 
                         foreach ($lead_chunks as $chunk_index => $lead_chunk) {
-                            if ($lead_id_from_catalog) {
-                                break 2; // Выходим из обоих циклов, если нашли
-                            }
+                            if ($lead_id_from_catalog) break 2;
 
-                            // Используем массовый API с filter[entity_id] для части сделок
                             $query_parts = [];
-                            foreach ($lead_chunk as $lead_id) {
-                                $query_parts[] = 'filter[entity_id][]=' . urlencode($lead_id);
+                            foreach ($lead_chunk as $lid) {
+                                $query_parts[] = 'filter[entity_id][]=' . urlencode($lid);
                             }
                             $query_parts[] = 'filter[to_entity_id]=' . urlencode($catalog_element_id);
                             $query_parts[] = 'filter[to_entity_type]=' . urlencode('catalog_elements');
-
                             if ($catalog_id) {
                                 $query_parts[] = 'filter[to_catalog_id]=' . urlencode($catalog_id);
                             }
 
-                            $query_string = implode('&', $query_parts);
-                            $links_api_url = "/api/v4/leads/links?" . $query_string;
-
-                            // Выполняем запрос напрямую через cURL
-                            $link = 'https://' . $subdomain . '.amocrm.ru' . $links_api_url;
+                            $links_api_url = "/api/v4/leads/links?" . implode('&', $query_parts);
+                            $link_url = 'https://' . $subdomain . '.amocrm.ru' . $links_api_url;
                             $access_token = $data['access_token'];
-                            $headers = ['Authorization: Bearer ' . $access_token];
 
                             $curl = curl_init();
                             curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
                             curl_setopt($curl, CURLOPT_USERAGENT, 'amoCRM-oAuth-client/1.0');
-                            curl_setopt($curl, CURLOPT_URL, $link);
-                            curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
+                            curl_setopt($curl, CURLOPT_URL, $link_url);
+                            curl_setopt($curl, CURLOPT_HTTPHEADER, ['Authorization: Bearer ' . $access_token]);
                             curl_setopt($curl, CURLOPT_HEADER, false);
                             curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, 1);
                             curl_setopt($curl, CURLOPT_SSL_VERIFYHOST, 2);
@@ -697,39 +542,25 @@ try {
                             if ($http_code >= 200 && $http_code <= 204) {
                                 $LINKS_RESPONSE = json_decode($out, true);
 
-                                $links_count = isset($LINKS_RESPONSE['_embedded']['links']) && is_array($LINKS_RESPONSE['_embedded']['links']) ? count($LINKS_RESPONSE['_embedded']['links']) : 0;
-
-                                if ($links_count > 0) {
-                                    // Проверяем все найденные связи, а не только первую
-                                    $found_matching_link = false;
-
-                                    foreach ($LINKS_RESPONSE['_embedded']['links'] as $link_index => $found_link) {
-                                        // Извлекаем ID сделки из связи
+                                if (!empty($LINKS_RESPONSE['_embedded']['links'])) {
+                                    foreach ($LINKS_RESPONSE['_embedded']['links'] as $found_link) {
                                         $lead_id_from_link = null;
 
-                                        // Вариант 1: entity_type = leads и to_entity_id = catalog_element_id (новая структура API)
                                         if (
-                                            isset($found_link['entity_id']) &&
                                             isset($found_link['entity_type']) &&
                                             $found_link['entity_type'] === 'leads' &&
                                             isset($found_link['to_entity_id']) &&
                                             $found_link['to_entity_id'] == $catalog_element_id
                                         ) {
                                             $lead_id_from_link = (int) $found_link['entity_id'];
-                                        }
-                                        // Вариант 2: from_entity_type = leads и to_entity_id = catalog_element_id (старая структура API)
-                                        elseif (
-                                            isset($found_link['from_entity_id']) &&
+                                        } elseif (
                                             isset($found_link['from_entity_type']) &&
                                             $found_link['from_entity_type'] === 'leads' &&
                                             isset($found_link['to_entity_id']) &&
                                             $found_link['to_entity_id'] == $catalog_element_id
                                         ) {
                                             $lead_id_from_link = (int) $found_link['from_entity_id'];
-                                        }
-                                        // Вариант 3: to_entity_type = leads и from_entity_id = catalog_element_id (старая структура API)
-                                        elseif (
-                                            isset($found_link['to_entity_id']) &&
+                                        } elseif (
                                             isset($found_link['to_entity_type']) &&
                                             $found_link['to_entity_type'] === 'leads' &&
                                             isset($found_link['from_entity_id']) &&
@@ -740,55 +571,30 @@ try {
 
                                         if ($lead_id_from_link) {
                                             $lead_id_from_catalog = $lead_id_from_link;
-                                            $found_matching_link = true;
                                             log_payment_info("✓ Сделка найдена через массовый API links", [
                                                 'lead_id' => $lead_id_from_catalog,
                                                 'total_checked' => $total_checked,
                                                 'total_processed' => $total_processed
                                             ]);
-                                            break 2; // Выходим из обоих циклов, если нашли
+                                            break 2;
                                         }
-                                    }
-
-                                    if (!$found_matching_link) {
-                                        log_payment_warning("Связи найдены, но не соответствуют критериям для извлечения lead_id", [
-                                            'catalog_element_id' => $catalog_element_id,
-                                            'total_links' => $links_count
-                                        ]);
                                     }
                                 }
                             } else {
                                 log_payment_warning("Ошибка HTTP при запросе к массовому API links", [
-                                    'page' => $page,
-                                    'chunk_index' => $chunk_index + 1,
                                     'http_code' => $http_code,
-                                    'curl_error' => $curl_error,
-                                    'response' => substr($out, 0, 500),
-                                    'api_url' => $links_api_url
+                                    'curl_error' => $curl_error
                                 ]);
                             }
                         }
                     }
 
-                    // Если уже нашли, выходим из цикла получения пулов
-                    if ($lead_id_from_catalog) {
-                        break;
-                    }
-
-                    // Если получили меньше сделок, чем размер пула, значит это последняя страница
-                    if ($leads_in_page < $leads_pool_size) {
-                        break;
-                    }
+                    if ($lead_id_from_catalog) break;
+                    if ($leads_in_page < $leads_pool_size) break;
 
                     $page++;
-
-                    // Защита от бесконечного цикла (максимум 25 страниц = 6250 сделок)
                     if ($page > 25) {
-                        log_payment_warning("Достигнут лимит страниц при получении сделок", [
-                            'max_pages' => 25,
-                            'total_processed' => $total_processed,
-                            'total_checked' => $total_checked
-                        ]);
+                        log_payment_warning("Достигнут лимит страниц при получении сделок");
                         break;
                     }
                 } while (true);
@@ -801,8 +607,7 @@ try {
                 } else {
                     log_payment_warning("Сделка не найдена через массовый API links", [
                         'total_processed' => $total_processed,
-                        'total_checked' => $total_checked,
-                        'pages_processed' => $page - 1
+                        'total_checked' => $total_checked
                     ]);
                 }
             } catch (Exception $mass_api_e) {
@@ -811,90 +616,51 @@ try {
                 ]);
             }
 
-            // Проверяем, найдена ли сделка
             if (!$lead_id_from_catalog) {
-                // Дополнительная диагностика: проверяем все кастомные поля счета на наличие любых ссылок
-                $all_field_codes = [];
-                $all_field_names = [];
-                $all_field_types = [];
-                if (isset($CATALOG_ELEMENT['custom_fields_values'])) {
-                    foreach ($CATALOG_ELEMENT['custom_fields_values'] as $field) {
-                        // Правильное извлечение данных из поля
-                        $field_code = $field['code'] ?? null;
-                        $field_name = $field['name'] ?? $field['field_name'] ?? null;
-                        $field_type = $field['field_type'] ?? null;
-
-                        $all_field_codes[] = $field_code ?: 'no_code';
-                        $all_field_names[] = $field_name ?: 'no_name';
-                        $all_field_types[] = $field_type ?: 'no_type';
-                    }
-                }
-
                 log_payment_error("Не удалось найти связанную сделку для счета", [
                     'catalog_element_id' => $catalog_element_id,
-                    'catalog_id' => $catalog_id,
-                    'catalog_name' => $CATALOG_ELEMENT['name'] ?? 'not_set',
-                    'total_checked' => $total_checked ?? 0
+                    'catalog_id' => $catalog_id
                 ]);
-
                 http_response_code(400);
                 echo json_encode([
                     'success' => false,
-                    'error' => 'Не удалось найти связанную сделку для счета. Счет не привязан к сделке в AmoCRM.',
+                    'error' => 'Не удалось найти связанную сделку для счета.',
                     'catalog_element_id' => $catalog_element_id,
-                    'catalog_id' => $catalog_id,
-                    'recommendation' => 'Проверьте в AmoCRM, что счет привязан к сделке через механизм связей. После привязки счета к сделке, обработка будет выполнена автоматически при следующем обновлении счета.'
+                    'catalog_id' => $catalog_id
                 ], JSON_UNESCAPED_UNICODE);
                 exit;
             }
 
-            // Извлекаем "Ссылку на оплату" из API ответа, если не была извлечена из вебхука
+            // Извлекаем ссылку на оплату из API ответа если не было в вебхуке
             if (!$payment_link && isset($CATALOG_ELEMENT['custom_fields_values'])) {
-                $catalog_custom_fields = $CATALOG_ELEMENT['custom_fields_values'] ?? [];
-                foreach ($catalog_custom_fields as $field) {
+                foreach ($CATALOG_ELEMENT['custom_fields_values'] as $field) {
                     $field_code = $field['code'] ?? null;
-                    $field_id = $field['field_id'] ?? null;
-
-                    // Проверяем по code (INVOICE_HASH_LINK) или по field_id (1622603, 1630781)
+                    $field_id   = $field['field_id'] ?? null;
                     if ($field_code === 'INVOICE_HASH_LINK' || $field_id == 1622603 || $field_id == 1630781) {
                         $field_values = $field['values'] ?? [];
                         if (!empty($field_values)) {
                             $payment_link_raw = is_array($field_values[0]) ? ($field_values[0]['value'] ?? null) : ($field_values[0] ?? null);
                             $payment_link = $payment_link_raw ? trim($payment_link_raw) : null;
-                            // Если после trim получилась пустая строка, считаем как null
-                            if ($payment_link === '') {
-                                $payment_link = null;
-                            }
+                            if ($payment_link === '') $payment_link = null;
                         }
                         break;
                     }
                 }
             }
 
-            // Используем данные из счета как транзакцию
             $amount = (float) $bill_price;
-            // Дата оплаты может быть в разных форматах
             if (is_array($bill_payment_date)) {
                 $payment_date = !empty($bill_payment_date) ? (int) $bill_payment_date[0] : time();
             } else {
                 $payment_date = $bill_payment_date ? (int) $bill_payment_date : time();
             }
-            $lead_id = $lead_id_from_catalog;
-
-            // Преобразуем дату в ISO 8601 формат
+            $lead_id  = $lead_id_from_catalog;
             $date_iso = date('c', $payment_date);
 
-            // Пропускаем шаг получения транзакции, переходим к получению данных сделки
-            // Устанавливаем lead_id для перехода к получению данных сделки
-            if ($lead_id_from_catalog) {
-                $lead_id = $lead_id_from_catalog;
-            }
         } catch (Exception $e) {
             log_payment_error("✗ Ошибка при обработке счета", [
                 'catalog_element_id' => $catalog_element_id,
-                'catalog_id' => $catalog_id,
                 'error' => $e->getMessage(),
-                'error_code' => $e->getCode(),
                 'trace' => $e->getTraceAsString()
             ]);
             http_response_code(500);
@@ -905,102 +671,54 @@ try {
             exit;
         }
 
-        // Переход к получению данных сделки после успешной обработки счета
         if (isset($lead_id) && $lead_id) {
             goto get_lead_data;
         }
     }
 
-    // Если получен ID сделки, нужно найти транзакции в этой сделке
+    // =========================================================================
+    // ОБРАБОТКА ВЕБХУКА ОТ СДЕЛКИ (поиск транзакции)
+    // =========================================================================
     if ($lead_id_from_webhook && !$transaction_id) {
         log_payment_info("Получен вебхук от сделки, ищем транзакции в сделке", [
             'lead_id' => $lead_id_from_webhook
         ]);
 
         try {
-            // Получаем данные сделки с транзакциями
             $api_url = '/api/v4/leads/' . $lead_id_from_webhook . '?with=transactions';
             $LEAD_WITH_TRANSACTIONS = get($subdomain, $api_url, $data);
 
-            log_payment_info("Данные сделки с транзакциями получены", [
-                'lead_id' => $lead_id_from_webhook,
-                'has_embedded' => isset($LEAD_WITH_TRANSACTIONS['_embedded']),
-                'has_transactions' => isset($LEAD_WITH_TRANSACTIONS['_embedded']['transactions']),
-                'transactions_count' => isset($LEAD_WITH_TRANSACTIONS['_embedded']['transactions'])
-                    ? count($LEAD_WITH_TRANSACTIONS['_embedded']['transactions'])
-                    : 0
-            ]);
-
-            // Ищем транзакции в сделке
             if (
                 isset($LEAD_WITH_TRANSACTIONS['_embedded']['transactions']) &&
                 is_array($LEAD_WITH_TRANSACTIONS['_embedded']['transactions']) &&
                 !empty($LEAD_WITH_TRANSACTIONS['_embedded']['transactions'])
             ) {
-
-                // Берем последнюю транзакцию (самую свежую)
-                $transactions = $LEAD_WITH_TRANSACTIONS['_embedded']['transactions'];
+                $transactions     = $LEAD_WITH_TRANSACTIONS['_embedded']['transactions'];
                 $last_transaction = end($transactions);
-                $transaction_id = $last_transaction['id'] ?? null;
+                $transaction_id   = $last_transaction['id'] ?? null;
 
                 if ($transaction_id) {
                     log_payment_info("✓ Найдена транзакция в сделке", [
-                        'lead_id' => $lead_id_from_webhook,
-                        'transaction_id' => $transaction_id,
-                        'total_transactions' => count($transactions),
-                        'transaction_price' => $last_transaction['price'] ?? $last_transaction['value'] ?? 'not_set',
-                        'transaction_date' => $last_transaction['created_at'] ?? $last_transaction['date'] ?? 'not_set'
-                    ]);
-                } else {
-                    log_payment_warning("Транзакции найдены, но не удалось извлечь ID", [
-                        'lead_id' => $lead_id_from_webhook,
-                        'transactions_count' => count($transactions),
-                        'last_transaction_keys' => is_array($last_transaction) ? array_keys($last_transaction) : 'not_array'
+                        'lead_id'        => $lead_id_from_webhook,
+                        'transaction_id' => $transaction_id
                     ]);
                 }
             } else {
-                // Если транзакций нет в embedded, пробуем получить через отдельный запрос
-                log_payment_info("Транзакции не найдены в embedded, пробуем отдельный запрос", [
-                    'lead_id' => $lead_id_from_webhook
-                ]);
-
                 $api_url = '/api/v4/leads/' . $lead_id_from_webhook . '/transactions';
                 $TRANSACTIONS_RESPONSE = get($subdomain, $api_url, $data);
 
-                log_payment_info("Ответ на запрос транзакций", [
-                    'has_embedded' => isset($TRANSACTIONS_RESPONSE['_embedded']),
-                    'has_transactions' => isset($TRANSACTIONS_RESPONSE['_embedded']['transactions']),
-                    'transactions_count' => isset($TRANSACTIONS_RESPONSE['_embedded']['transactions'])
-                        ? count($TRANSACTIONS_RESPONSE['_embedded']['transactions'])
-                        : 0,
-                    'response_structure' => is_array($TRANSACTIONS_RESPONSE) ? array_keys($TRANSACTIONS_RESPONSE) : 'not_array'
-                ]);
-
                 if (
                     isset($TRANSACTIONS_RESPONSE['_embedded']['transactions']) &&
-                    is_array($TRANSACTIONS_RESPONSE['_embedded']['transactions']) &&
                     !empty($TRANSACTIONS_RESPONSE['_embedded']['transactions'])
                 ) {
-
-                    $transactions = $TRANSACTIONS_RESPONSE['_embedded']['transactions'];
+                    $transactions     = $TRANSACTIONS_RESPONSE['_embedded']['transactions'];
                     $last_transaction = end($transactions);
-                    $transaction_id = $last_transaction['id'] ?? null;
-
-                    if ($transaction_id) {
-                        log_payment_info("✓ Транзакция найдена через отдельный запрос", [
-                            'lead_id' => $lead_id_from_webhook,
-                            'transaction_id' => $transaction_id,
-                            'total_transactions' => count($transactions)
-                        ]);
-                    }
+                    $transaction_id   = $last_transaction['id'] ?? null;
                 }
             }
 
             if (!$transaction_id) {
-                log_payment_info("ℹ В сделке не найдено транзакций - пропускаем обработку", [
-                    'lead_id' => $lead_id_from_webhook,
-                    'note' => 'Транзакция может быть создана позже. Обработка будет выполнена при получении вебхука от транзакции.'
-                ]);
+                log_payment_info("В сделке не найдено транзакций — пропускаем", ['lead_id' => $lead_id_from_webhook]);
                 http_response_code(200);
                 echo json_encode([
                     'success' => true,
@@ -1012,171 +730,85 @@ try {
         } catch (Exception $e) {
             log_payment_error("✗ Ошибка при поиске транзакций в сделке", [
                 'lead_id' => $lead_id_from_webhook,
-                'error' => $e->getMessage(),
-                'error_code' => $e->getCode(),
-                'trace' => $e->getTraceAsString()
+                'error'   => $e->getMessage()
             ]);
             http_response_code(500);
-            echo json_encode([
-                'success' => false,
-                'error' => 'Ошибка при поиске транзакций в сделке: ' . $e->getMessage()
-            ]);
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
             exit;
         }
     }
 
-    // Получаем данные транзакции из AmoCRM API
+    // =========================================================================
+    // ОБРАБОТКА ТРАНЗАКЦИИ
+    // =========================================================================
     $api_url = '/api/v4/transactions/' . $transaction_id;
     try {
         $TRANSACTION = get($subdomain, $api_url, $data);
     } catch (Exception $e) {
-        log_payment_error("✗ Ошибка при получении данных транзакции из AmoCRM", [
+        log_payment_error("✗ Ошибка при получении данных транзакции", [
             'transaction_id' => $transaction_id,
-            'api_url' => $api_url,
-            'error' => $e->getMessage(),
-            'error_code' => $e->getCode(),
-            'trace' => $e->getTraceAsString()
-        ], 'add_payment.php');
-        http_response_code(500);
-        echo json_encode([
-            'success' => false,
-            'error' => 'Ошибка при получении данных транзакции: ' . $e->getMessage()
+            'error'          => $e->getMessage()
         ]);
+        http_response_code(500);
+        echo json_encode(['success' => false, 'error' => 'Ошибка при получении данных транзакции: ' . $e->getMessage()]);
         exit;
     }
 
-    // Извлекаем данные из транзакции
-    $lead_id = $TRANSACTION['lead_id'] ?? null;
-    $amount = $TRANSACTION['price'] ?? $TRANSACTION['value'] ?? null;
+    $lead_id          = $TRANSACTION['lead_id'] ?? null;
+    $amount           = $TRANSACTION['price'] ?? $TRANSACTION['value'] ?? null;
     $transaction_date = $TRANSACTION['created_at'] ?? $TRANSACTION['date'] ?? time();
 
-    log_payment_info("Извлечение полей из транзакции", [
-        'lead_id_raw' => $TRANSACTION['lead_id'] ?? 'not_set',
-        'price_raw' => $TRANSACTION['price'] ?? 'not_set',
-        'value_raw' => $TRANSACTION['value'] ?? 'not_set',
-        'created_at_raw' => $TRANSACTION['created_at'] ?? 'not_set',
-        'date_raw' => $TRANSACTION['date'] ?? 'not_set',
-        'extracted_lead_id' => $lead_id,
-        'extracted_amount' => $amount,
-        'extracted_date' => $transaction_date
-    ]);
-
     if (!$lead_id) {
-        log_payment_error("✗ Транзакция не содержит lead_id", [
-            'transaction_id' => $transaction_id,
-            'transaction_keys' => array_keys($TRANSACTION),
-            'transaction_data' => $TRANSACTION
-        ]);
+        log_payment_error("✗ Транзакция не содержит lead_id", ['transaction_id' => $transaction_id]);
         http_response_code(400);
-        echo json_encode([
-            'success' => false,
-            'error' => 'Транзакция не связана со сделкой (lead_id отсутствует)'
-        ]);
+        echo json_encode(['success' => false, 'error' => 'Транзакция не связана со сделкой']);
         exit;
     }
 
     if (!$amount || !is_numeric($amount)) {
-        log_payment_error("Транзакция не содержит сумму или сумма не числовая", [
-            'transaction_id' => $transaction_id,
-            'amount_raw' => $amount
-        ]);
+        log_payment_error("Транзакция не содержит корректную сумму", ['transaction_id' => $transaction_id]);
         http_response_code(400);
-        echo json_encode([
-            'success' => false,
-            'error' => 'Транзакция не содержит корректную сумму оплаты'
-        ]);
+        echo json_encode(['success' => false, 'error' => 'Транзакция не содержит корректную сумму оплаты']);
         exit;
     }
 
-    // Преобразуем дату в ISO 8601 формат
     if (is_numeric($transaction_date)) {
-        // Unix timestamp
         $date_iso = date('c', $transaction_date);
     } else {
-        // Строка даты
         $date_timestamp = strtotime($transaction_date);
-        if ($date_timestamp === false) {
-            $date_iso = date('c'); // Используем текущую дату
-            log_payment_warning("Не удалось распарсить дату транзакции, используем текущую", [
-                'transaction_date' => $transaction_date,
-                'current_date_iso' => $date_iso
-            ]);
-        } else {
-            $date_iso = date('c', $date_timestamp);
-        }
+        $date_iso = $date_timestamp !== false ? date('c', $date_timestamp) : date('c');
     }
 
-    // Проверяем, что у нас есть все необходимые данные
-    if (!$lead_id || !$amount || !$date_iso) {
-        log_payment_error("✗ Не все необходимые данные получены", [
-            'has_lead_id' => !empty($lead_id),
-            'has_amount' => !empty($amount),
-            'has_date_iso' => !empty($date_iso),
-            'transaction_id' => $transaction_id ?? 'not_set',
-            'catalog_element_id' => $catalog_element_id ?? 'not_set'
-        ]);
-        http_response_code(400);
-        echo json_encode([
-            'success' => false,
-            'error' => 'Не удалось получить все необходимые данные для обработки оплаты'
-        ]);
-        exit;
-    }
-
-    // Получаем данные сделки из AmoCRM API
+    // =========================================================================
+    // ПОЛУЧЕНИЕ ДАННЫХ СДЕЛКИ
+    // =========================================================================
     get_lead_data:
     $api_url = '/api/v4/leads/' . $lead_id;
     try {
         $LEAD = get($subdomain, $api_url, $data);
     } catch (Exception $e) {
-        log_payment_error("✗ Ошибка при получении данных сделки из AmoCRM", [
+        log_payment_error("✗ Ошибка при получении данных сделки", [
             'lead_id' => $lead_id,
-            'api_url' => $api_url,
-            'error' => $e->getMessage(),
-            'error_code' => $e->getCode(),
-            'trace' => $e->getTraceAsString()
-        ], 'add_payment.php');
-        http_response_code(500);
-        echo json_encode([
-            'success' => false,
-            'error' => 'Ошибка при получении данных сделки: ' . $e->getMessage()
+            'error'   => $e->getMessage()
         ]);
+        http_response_code(500);
+        echo json_encode(['success' => false, 'error' => 'Ошибка при получении данных сделки: ' . $e->getMessage()]);
         exit;
     }
 
-    // Извлекаем clientId из кастомных полей сделки
-    $client_id = null;
-    $custom_fields_values = $LEAD["custom_fields_values"] ?? [];
-    $profile_link = null;
+    // =========================================================================
+    // ПОИСК clientId СТУДЕНТА
+    // =========================================================================
+    $client_id           = null;
+    $profile_link        = null;
     $resolved_profile_id = null;
+    $custom_fields_values = $LEAD['custom_fields_values'] ?? [];
 
-    // Список возможных field_id для clientId (можно добавить в конфиг)
-    // Пока используем пустой массив - нужно будет указать field_id после настройки поля в AmoCRM
-    $client_id_field_ids = [];
-
-    // Если в конфиге указан field_id для clientId
-    if (function_exists('get_config')) {
-        $client_id_field_id = get_config('amo.client_id_field_id');
-        if ($client_id_field_id) {
-            $client_id_field_ids[] = $client_id_field_id;
-        }
-    }
-
+    // Шаг 1: ищем ссылку на профиль в кастомных полях сделки
     foreach ($custom_fields_values as $field) {
-        $field_id = $field["field_id"] ?? null;
-        $field_value = $field["values"][0]["value"] ?? null;
+        $field_id    = $field['field_id'] ?? null;
+        $field_value = $field['values'][0]['value'] ?? null;
 
-        // Проверяем, является ли это полем для clientId
-        if (in_array($field_id, $client_id_field_ids) && !empty($field_value)) {
-            $client_id = trim($field_value);
-            log_payment_info("clientId найден в кастомном поле", [
-                'field_id' => $field_id,
-                'clientId' => $client_id
-            ]);
-            break;
-        }
-
-        // Сохраняем ссылку на профиль для дальнейшего использования
         if ($field_id == AMO_FIELD_PROFILE_LINK && !empty($field_value)) {
             $profile_link = trim((string) $field_value);
             if (preg_match('/\/Profile\/(\d+)/', $profile_link, $matches)) {
@@ -1185,507 +817,244 @@ try {
         }
     }
 
-    // Если clientId не найден в кастомных полях, пытаемся получить через GetStudents по ссылке на профиль
-    if (!$client_id && $profile_link) {
-        // Извлекаем profile_id из ссылки: https://{subdomain}.t8s.ru/Profile/{profile_id}
-        if (preg_match('/\/Profile\/(\d+)/', $profile_link, $matches)) {
-            $profile_id = $matches[1];
+    // Шаг 2: если есть ссылка на профиль — получаем clientId через GetStudents
+    if (!$client_id && $profile_link && $resolved_profile_id) {
+        try {
+            $api_response = call_hollyhop_api('GetStudents', ['Id' => $resolved_profile_id], $auth_key, $api_base_url);
 
-            try {
-
-                // Пробуем получить студента по profile_id (Id)
-                $get_student_params = [
-                    'Id' => $profile_id
-                ];
-                $api_response = call_hollyhop_api('GetStudents', $get_student_params, $auth_key, $api_base_url);
-
-                // Обрабатываем ответ (аналогично add_student.php)
-                $student_info = null;
-                if (is_array($api_response)) {
-                    if (isset($api_response['ClientId']) || isset($api_response['clientId'])) {
-                        $student_info = $api_response;
-                    } elseif (isset($api_response['Students']) && is_array($api_response['Students'])) {
-                        foreach ($api_response['Students'] as $idx => $student) {
-                            if (is_array($student) && (($student['Id'] ?? $student['id'] ?? null) == $profile_id)) {
-                                $student_info = $student;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if ($student_info) {
-                    $resolved_profile_id = $resolved_profile_id ?: extract_student_profile_id($student_info);
-                    $client_id = $student_info['ClientId'] ?? $student_info['clientId'] ?? null;
-                    if ($client_id) {
-                        log_payment_info("clientId получен через GetStudents", [
-                            'profile_id' => $profile_id,
-                            'clientId' => $client_id
-                        ]);
-                    } else {
-                        log_payment_warning("Студент найден, но clientId отсутствует", [
-                            'profile_id' => $profile_id
-                        ]);
-                    }
-                } else {
-                    log_payment_warning("Студент не найден в ответе GetStudents", [
-                        'profile_id' => $profile_id
-                    ]);
-                }
-            } catch (Exception $e) {
-                log_payment_error("✗ Ошибка при получении clientId через GetStudents", [
-                    'profile_id' => $profile_id,
-                    'error' => $e->getMessage(),
-                    'error_code' => $e->getCode(),
-                    'trace' => $e->getTraceAsString()
-                ]);
-            }
-        } else {
-            log_payment_warning("Не удалось извлечь profile_id из ссылки", [
-                'profile_link' => $profile_link,
-                'regex_pattern' => '/\/Profile\/(\d+)/'
-            ]);
-        }
-    }
-
-if (!$client_id) {
-    try {
-        // Получаем контакты сделки
-        $api_url = '/api/v4/leads/' . $lead_id . '?with=contacts';
-        $LEAD_WITH_CONTACTS = get($subdomain, $api_url, $data);
-
-        $contact_phone = null;
-        $contact_email = null;
-
-        // Извлекаем телефон и email из контактов
-        if (
-            isset($LEAD_WITH_CONTACTS['_embedded']['contacts']) &&
-            is_array($LEAD_WITH_CONTACTS['_embedded']['contacts']) &&
-            !empty($LEAD_WITH_CONTACTS['_embedded']['contacts'])
-        ) {
-
-            $contact_id = $LEAD_WITH_CONTACTS['_embedded']['contacts'][0]['id'] ?? null;
-            if ($contact_id) {
-                $api_url = '/api/v4/contacts/' . $contact_id;
-                $CONTACT = get($subdomain, $api_url, $data);
-
-                $contact_fields = $CONTACT['custom_fields_values'] ?? [];
-                foreach ($contact_fields as $field) {
-                    $field_id = $field['field_id'] ?? null;
-                    $field_value = $field['values'][0]['value'] ?? null;
-
-                    // Телефон (обычно field_id 1138327) и email (1138329)
-                    if ($field_id == AMO_CONTACT_FIELD_PHONE) {
-                        $contact_phone = preg_replace('/[^0-9]/', '', $field_value); // Очищаем телефон
-                    } elseif ($field_id == AMO_CONTACT_FIELD_EMAIL) {
-                        $contact_email = strtolower(trim($field_value)); // Нормализуем email
-                    }
-                }
-            }
-        }
-
-        // Пытаемся найти студента по телефону или email
-        if ($contact_phone || $contact_email) {
-            $search_params = [];
-            if ($contact_phone) {
-                $search_params['phone'] = $contact_phone;
-            } elseif ($contact_email) {
-                $search_params['email'] = $contact_email;
-            }
-
-            log_payment_info("Поиск студента в Hollyhop по контактам", $search_params);
-
-            $api_response = call_hollyhop_api('GetStudents', $search_params, $auth_key, $api_base_url);
-
-            // Обрабатываем ответ GetStudents
-            $found_students = [];
+            $student_info = null;
             if (is_array($api_response)) {
-                if (isset($api_response['Students']) && is_array($api_response['Students'])) {
-                    $found_students = $api_response['Students'];
-                } elseif (isset($api_response['ClientId']) || isset($api_response['clientId'])) {
-                    $found_students = [$api_response];
-                } elseif (is_array($api_response) && !empty($api_response) && isset($api_response[0])) {
-                    $found_students = $api_response;
-                }
-            }
-
-            if (!empty($found_students)) {
-                // ИСПРАВЛЕНИЕ: Фильтруем найденных студентов по точному соответствию
-                $matched_student = null;
-                
-                // Очищаем искомый телефон для сравнения
-                $search_phone_clean = $contact_phone ? preg_replace('/[^0-9]/', '', $contact_phone) : null;
-                $search_email_lower = $contact_email ? strtolower(trim($contact_email)) : null;
-                
-                foreach ($found_students as $student) {
-                    $student_id = $student['ClientId'] ?? $student['clientId'] ?? null;
-                    
-                    // Пропускаем студентов без ID
-                    if (!$student_id) continue;
-                    
-                    // Проверяем телефоны студента
-                    if ($search_phone_clean) {
-                        $student_phones = [];
-                        
-                        // Собираем все телефоны из разных полей студента
-                        if (isset($student['Phone'])) {
-                            $student_phones[] = $student['Phone'];
-                        }
-                        if (isset($student['phone'])) {
-                            $student_phones[] = $student['phone'];
-                        }
-                        if (isset($student['MobilePhone'])) {
-                            $student_phones[] = $student['MobilePhone'];
-                        }
-                        if (isset($student['mobilePhone'])) {
-                            $student_phones[] = $student['mobilePhone'];
-                        }
-                        if (isset($student['HomePhone'])) {
-                            $student_phones[] = $student['HomePhone'];
-                        }
-                        if (isset($student['AdditionalPhones']) && is_array($student['AdditionalPhones'])) {
-                            $student_phones = array_merge($student_phones, $student['AdditionalPhones']);
-                        }
-                        
-                        // Очищаем и проверяем каждый телефон
-                        foreach ($student_phones as $student_phone) {
-                            $student_phone_clean = preg_replace('/[^0-9]/', '', $student_phone);
-                            if ($student_phone_clean === $search_phone_clean) {
-                                $matched_student = $student;
-                                break 2; // Выходим из обоих циклов
-                            }
-                        }
-                    }
-                    
-                    // Проверяем email студента
-                    if ($search_email_lower && !$matched_student) {
-                        $student_email = null;
-                        
-                        if (isset($student['Email'])) {
-                            $student_email = strtolower(trim($student['Email']));
-                        } elseif (isset($student['email'])) {
-                            $student_email = strtolower(trim($student['email']));
-                        }
-                        
-                        if ($student_email && $student_email === $search_email_lower) {
-                            $matched_student = $student;
+                if (isset($api_response['ClientId']) || isset($api_response['clientId'])) {
+                    $student_info = $api_response;
+                } elseif (isset($api_response['Students']) && is_array($api_response['Students'])) {
+                    foreach ($api_response['Students'] as $student) {
+                        if (is_array($student) && (($student['Id'] ?? $student['id'] ?? null) == $resolved_profile_id)) {
+                            $student_info = $student;
                             break;
                         }
                     }
                 }
-                
-                // Если нашли точное совпадение, используем его
-                if ($matched_student) {
-                    $resolved_profile_id = $resolved_profile_id ?: extract_student_profile_id($matched_student);
-                    $client_id = $matched_student['ClientId'] ?? $matched_student['clientId'] ?? null;
-                    
-                    log_payment_info("clientId найден через поиск по контактам (точное совпадение)", [
-                        'clientId' => $client_id,
-                        'search_by' => $contact_phone ? 'phone' : 'email',
-                        'total_found' => count($found_students)
+            }
+
+            if ($student_info) {
+                $client_id = $student_info['ClientId'] ?? $student_info['clientId'] ?? null;
+                if ($client_id) {
+                    log_payment_info("clientId получен через GetStudents по profile_id", [
+                        'profile_id' => $resolved_profile_id,
+                        'clientId'   => $client_id
                     ]);
-                } else {
-                    // Если точного совпадения нет, логируем предупреждение
-                    log_payment_warning("Найдены студенты, но нет точного совпадения по контактам", [
-                        'students_found' => count($found_students),
-                        'search_phone' => $search_phone_clean,
-                        'search_email' => $search_email_lower
-                    ]);
-                    
-                    // Дополнительно логируем первых нескольких студентов для отладки
-                    $debug_students = array_slice($found_students, 0, 3);
-                    foreach ($debug_students as $idx => $student) {
-                        log_payment_debug("Студент " . ($idx + 1) . " для отладки", [
-                            'clientId' => $student['ClientId'] ?? $student['clientId'] ?? 'N/A',
-                            'phone' => $student['Phone'] ?? $student['phone'] ?? 'N/A',
-                            'email' => $student['Email'] ?? $student['email'] ?? 'N/A'
-                        ]);
-                    }
                 }
-            } else {
-                log_payment_warning("Студент не найден в Hollyhop по контактам", [
-                    'search_params' => $search_params
-                ]);
             }
-        } else {
-            log_payment_warning("В сделке не найдены контакты (телефон/email) для поиска студента");
-        }
-    } catch (Exception $contact_e) {
-        log_payment_warning("Ошибка при поиске студента по контактам", [
-            'error' => $contact_e->getMessage()
-        ]);
-    }
-}
-
-    // Если clientId не найден стандартными способами, запускаем полный сценарий add_student.php
-    if (!$client_id) {
-        try {
-            $ensure_result = ensure_student_card_for_payment($lead_id, $LEAD, $subdomain, $data);
-            $client_id = $ensure_result['client_id'] ?? null;
-            $resolved_profile_id = is_numeric($ensure_result['profile_id'] ?? null)
-                ? (int) $ensure_result['profile_id']
-                : $resolved_profile_id;
-
-            if (!empty($ensure_result['profile_link'])) {
-                $profile_link = $ensure_result['profile_link'];
-            }
-
-            if ($client_id) {
-                log_payment_info("clientId получен через add_student.php", [
-                    'lead_id' => $lead_id,
-                    'clientId' => $client_id,
-                    'profile_link' => $profile_link
-                ]);
-            }
-        } catch (Exception $ensure_student_e) {
-            log_payment_warning("Не удалось обеспечить карточку через add_student.php", [
-                'lead_id' => $lead_id,
-                'error' => $ensure_student_e->getMessage()
+        } catch (Exception $e) {
+            log_payment_error("✗ Ошибка при получении clientId через GetStudents", [
+                'profile_id' => $resolved_profile_id,
+                'error'      => $e->getMessage()
             ]);
         }
     }
 
-    // Если clientId всё ещё не найден, возвращаем ошибку
+    // Шаг 3: если clientId не найден — вызываем index.php
+    // index.php содержит полную логику: поиск по телефону, создание студента,
+    // маппинг полей, запись ссылки на профиль в сделку AmoCRM.
     if (!$client_id) {
-        log_payment_error("✗✗✗ Не удалось найти clientId в сделке", [
-            'lead_id' => $lead_id,
-            'custom_fields_count' => count($custom_fields_values),
-            'profile_link' => $profile_link,
-            'searched_field_ids' => $client_id_field_ids,
-            'custom_fields_summary' => array_map(function ($field) {
-                return [
-                    'field_id' => $field['field_id'] ?? 'unknown',
-                    'has_value' => !empty($field['values'][0]['value'] ?? null)
-                ];
-            }, $custom_fields_values)
+        log_payment_info("clientId не найден, вызываем index.php для создания/поиска студента", [
+            'lead_id'      => $lead_id,
+            'profile_link' => $profile_link
+        ]);
+
+        try {
+            $index_result = call_index_for_student($lead_id, $LEAD, $subdomain, $data, $auth_key, $api_base_url);
+            $client_id           = $index_result['client_id'] ?? null;
+            $resolved_profile_id = $index_result['profile_id'] ?? $resolved_profile_id;
+            if (!empty($index_result['profile_link'])) {
+                $profile_link = $index_result['profile_link'];
+            }
+
+            if ($client_id) {
+                log_payment_info("clientId получен через index.php", [
+                    'lead_id'  => $lead_id,
+                    'clientId' => $client_id
+                ]);
+            }
+        } catch (Exception $index_e) {
+            log_payment_warning("Не удалось получить clientId через index.php", [
+                'lead_id' => $lead_id,
+                'error'   => $index_e->getMessage()
+            ]);
+        }
+    }
+
+    // Если clientId всё ещё не найден — возвращаем ошибку
+    if (!$client_id) {
+        log_payment_error("✗✗✗ Не удалось найти clientId ни одним из способов", [
+            'lead_id'      => $lead_id,
+            'profile_link' => $profile_link
         ]);
         http_response_code(400);
         echo json_encode([
             'success' => false,
-            'error' => 'Не удалось найти clientId студента в сделке. Убедитесь, что в сделке заполнено поле с ID студента (clientId) из Hollyhop, ссылка на профиль студента, или что в сделке есть контакт с телефоном/email, по которому можно найти студента в Hollyhop.'
+            'error'   => 'Не удалось найти clientId студента. Проверьте что в сделке есть контакт с телефоном/email и что студент может быть найден или создан в Hollyhop.'
         ], JSON_UNESCAPED_UNICODE);
         exit;
     }
 
-    log_payment_info("clientId найден в сделке", [
-        'lead_id' => $lead_id,
-        'clientId' => $client_id,
-        'profile_link' => $profile_link
+    log_payment_info("clientId найден", [
+        'lead_id'  => $lead_id,
+        'clientId' => $client_id
     ]);
 
-    // Получаем officeOrCompanyId из данных студента через GetStudents
-    $office_id = null;
+    // =========================================================================
+    // ПОЛУЧЕНИЕ officeOrCompanyId СТУДЕНТА
+    // =========================================================================
+    $office_id    = null;
     $student_info = null;
+
     try {
-        $get_student_params = [
-            'clientId' => $client_id
-        ];
+        $api_response = call_hollyhop_api('GetStudents', ['clientId' => $client_id], $auth_key, $api_base_url);
 
-        $api_response = call_hollyhop_api('GetStudents', $get_student_params, $auth_key, $api_base_url);
-
-        // API может вернуть:
-        // 1. Объект с полем Students (массив студентов)
-        // 2. Массив студентов напрямую
-        // 3. Один объект студента (при использовании clientId)
         if (is_array($api_response)) {
-            // Проверяем, это массив студентов или объект с полем Students
             if (isset($api_response['Students']) && is_array($api_response['Students'])) {
-                // Ищем студента с нужным ClientId в массиве
-                foreach ($api_response['Students'] as $idx => $student) {
-                    if (is_array($student)) {
-                        $student_client_id = $student['ClientId'] ?? $student['clientId'] ?? null;
-                        if ($student_client_id == $client_id) {
-                            $student_info = $student;
-                            break;
-                        }
+                foreach ($api_response['Students'] as $student) {
+                    if (is_array($student) && ($student['ClientId'] ?? $student['clientId'] ?? null) == $client_id) {
+                        $student_info = $student;
+                        break;
                     }
                 }
             } elseif (isset($api_response['ClientId']) || isset($api_response['clientId'])) {
-                // Это один студент (при использовании clientId)
                 $student_info = $api_response;
             } else {
-                // Это массив студентов напрямую
-                foreach ($api_response as $idx => $student) {
-                    if (is_array($student)) {
-                        $student_client_id = $student['ClientId'] ?? $student['clientId'] ?? null;
-                        if ($student_client_id == $client_id) {
-                            $student_info = $student;
-                            break;
-                        }
+                foreach ($api_response as $student) {
+                    if (is_array($student) && ($student['ClientId'] ?? $student['clientId'] ?? null) == $client_id) {
+                        $student_info = $student;
+                        break;
                     }
                 }
             }
         }
 
         if ($student_info === null) {
-            log_payment_error("✗ Студент не найден в ответе GetStudents", [
-                'clientId' => $client_id,
-                'response_structure' => is_array($api_response) ? array_keys($api_response) : 'not_array'
-            ]);
             throw new Exception("Студент с clientId = {$client_id} не найден в системе Hollyhop");
         }
 
         $resolved_profile_id = $resolved_profile_id ?: extract_student_profile_id($student_info);
 
-        // Извлекаем officeOrCompanyId из данных студента
-        // Сначала пробуем прямые поля
         $office_id = $student_info['OfficeOrCompanyId'] ??
             $student_info['officeOrCompanyId'] ??
             $student_info['OfficeOrCompany'] ??
             $student_info['officeOrCompany'] ?? null;
 
-        // Если не найдено, пробуем извлечь из массива OfficesAndCompanies
-        if ($office_id === null) {
-            if (
-                isset($student_info['OfficesAndCompanies']) &&
-                is_array($student_info['OfficesAndCompanies']) &&
-                !empty($student_info['OfficesAndCompanies'])
-            ) {
-
-                $first_office = $student_info['OfficesAndCompanies'][0];
-                if (is_array($first_office) && !empty($first_office)) {
-                    // Пробуем разные варианты названий полей
-                    $office_id = $first_office['Id'] ??
-                        $first_office['id'] ??
-                        $first_office['OfficeOrCompanyId'] ??
-                        $first_office['officeOrCompanyId'] ??
-                        $first_office['OfficeId'] ??
-                        $first_office['officeId'] ?? null;
-                }
+        if ($office_id === null && isset($student_info['OfficesAndCompanies']) && is_array($student_info['OfficesAndCompanies'])) {
+            $first_office = $student_info['OfficesAndCompanies'][0] ?? null;
+            if (is_array($first_office)) {
+                $office_id = $first_office['Id'] ??
+                    $first_office['id'] ??
+                    $first_office['OfficeOrCompanyId'] ??
+                    $first_office['officeOrCompanyId'] ?? null;
             }
         }
 
         if ($office_id === null) {
-            log_payment_error("✗ officeOrCompanyId не найден в данных студента", [
-                'clientId' => $client_id,
-                'has_OfficesAndCompanies' => isset($student_info['OfficesAndCompanies'])
-            ]);
             throw new Exception("Не удалось получить officeOrCompanyId для студента с clientId = {$client_id}");
         }
     } catch (Exception $e) {
         log_payment_error("✗ Ошибка при получении officeOrCompanyId", [
             'clientId' => $client_id,
-            'error' => $e->getMessage(),
-            'error_code' => $e->getCode(),
-            'trace' => $e->getTraceAsString()
-        ], 'add_payment.php');
-
-        http_response_code(404);
-        echo json_encode([
-            'success' => false,
-            'error' => $e->getMessage()
+            'error'    => $e->getMessage()
         ]);
+        http_response_code(404);
+        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
         exit;
     }
 
-    // Если ссылка на профиль в сделке отсутствует, восстанавливаем ее перед AddPayment
+    // Восстанавливаем ссылку на профиль в сделке если её нет
     if (!$profile_link && $resolved_profile_id) {
         $hollyhop_subdomain = $api_config['subdomain'] ?? null;
         if (!empty($hollyhop_subdomain)) {
             $profile_link = build_hollyhop_profile_link($resolved_profile_id, $hollyhop_subdomain);
             try {
                 update_lead_profile_link_in_amocrm($lead_id, $profile_link, $subdomain, $data);
-                log_payment_info("Ссылка на профиль восстановлена в сделке перед AddPayment", [
-                    'lead_id' => $lead_id,
-                    'profile_id' => $resolved_profile_id,
+                log_payment_info("Ссылка на профиль восстановлена в сделке", [
+                    'lead_id'      => $lead_id,
                     'profile_link' => $profile_link
                 ]);
             } catch (Exception $e) {
-                log_payment_warning("Не удалось сохранить восстановленную ссылку на профиль в сделке", [
+                log_payment_warning("Не удалось сохранить ссылку на профиль", [
                     'lead_id' => $lead_id,
-                    'profile_id' => $resolved_profile_id,
-                    'profile_link' => $profile_link,
-                    'error' => $e->getMessage()
+                    'error'   => $e->getMessage()
                 ]);
             }
-        } else {
-            log_payment_warning("Невозможно восстановить ссылку на профиль: не задан subdomain Hollyhop в конфиге", [
-                'lead_id' => $lead_id,
-                'profile_id' => $resolved_profile_id
-            ]);
         }
     }
 
-    // Формируем параметры для AddPayment
-    log_payment_info("Формирование параметров для AddPayment", [
-        'clientId' => $client_id,
-        'officeOrCompanyId' => $office_id,
-        'amount' => $amount,
-        'date_iso' => $date_iso,
-        'has_payment_link' => !empty($payment_link),
-        'payment_link' => $payment_link ? substr($payment_link, 0, 20) . '...' : null
-    ]);
+    // =========================================================================
+    // ФОРМИРОВАНИЕ И ОТПРАВКА ОПЛАТЫ
+    // =========================================================================
 
-    // Определяем paymentMethodId на основе наличия "Ссылки на оплату"
-    // Если поле "Ссылка на оплату" заполнено → paymentMethodId = 23 (Тбанк)
-    // Если не заполнено → paymentMethodId = 19 (ПСБ)
-    // Если счет оплачен в амо - в холи передается статус "Ожидает проведения"
     function mapAmoStatusToHollyState(string $amoStatus): string
     {
         $amoStatus = mb_strtolower(trim($amoStatus));
-
         return match (true) {
             str_contains($amoStatus, 'оплачен') => 'Unconfirmed',
-            str_contains($amoStatus, 'част') => 'Unconfirmed',
+            str_contains($amoStatus, 'част')    => 'Unconfirmed',
             str_contains($amoStatus, 'не оплачен') => 'Unpaid',
-            str_contains($amoStatus, 'отмен') => 'Unpaid',
+            str_contains($amoStatus, 'отмен')   => 'Unpaid',
             default => 'Unconfirmed'
         };
     }
 
-    $payment_state = mapAmoStatusToHollyState($bill_status); // Всегда "Проведен, ожидает подтверждения"
+    $payment_state     = isset($bill_status) ? mapAmoStatusToHollyState($bill_status) : 'Unconfirmed';
     $payment_method_id = !empty($payment_link) ? 23 : 19; // Тбанк (23) или ПСБ (19)
 
-    log_payment_info("Определение способа оплаты и статуса", [
-        'payment_link' => $payment_link ? substr($payment_link, 0, 20) . '...' : null,
-        'payment_method_id' => $payment_method_id,
+    log_payment_info("Формирование параметров для AddPayment", [
+        'clientId'           => $client_id,
+        'officeOrCompanyId'  => $office_id,
+        'amount'             => $amount,
+        'date_iso'           => $date_iso,
+        'payment_method_id'  => $payment_method_id,
         'payment_method_name' => $payment_method_id == 23 ? 'Тбанк (23)' : 'ПСБ (19)',
-        'payment_state' => $payment_state
+        'payment_state'      => $payment_state
     ]);
 
     $payment_params = [
-        'clientId' => $client_id,
+        'clientId'          => $client_id,
         'officeOrCompanyId' => $office_id,
-        'date' => $date_iso,
-        'value' => (float)$amount,
-        'state' => $payment_state,
-        'paymentMethodId' => $payment_method_id
+        'date'              => $date_iso,
+        'value'             => (float) $amount,
+        'state'             => $payment_state,
+        'paymentMethodId'   => $payment_method_id
     ];
 
-    // Вызываем API для записи оплаты
     $result = call_hollyhop_api('AddPayment', $payment_params, $auth_key, $api_base_url);
 
-    log_payment_info("Оплата успешно записана", [
-        'clientId' => $client_id,
-        'amount' => $amount,
-        'paymentMethodId' => $payment_method_id
+    log_payment_info("✓ Оплата успешно записана", [
+        'clientId'          => $client_id,
+        'amount'            => $amount,
+        'paymentMethodId'   => $payment_method_id
     ]);
 
-    // Возвращаем успешный ответ
     http_response_code(200);
     echo json_encode([
         'success' => true,
         'message' => 'Оплата успешно записана',
         'payment' => [
-            'clientId' => $client_id,
+            'clientId'          => $client_id,
             'officeOrCompanyId' => $office_id,
-            'date' => $date_iso,
-            'value' => (float)$amount
+            'date'              => $date_iso,
+            'value'             => (float) $amount
         ],
         'api_response' => $result
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
 } catch (Exception $e) {
     http_response_code(500);
-
     $error_message = $e->getMessage();
     log_payment_error("Ошибка обработки платежа", [
         'error_message' => $error_message,
-        'error_file' => $e->getFile(),
-        'error_line' => $e->getLine()
+        'error_file'    => $e->getFile(),
+        'error_line'    => $e->getLine()
     ]);
-
     echo json_encode([
         'success' => false,
-        'error' => $error_message
+        'error'   => $error_message
     ], JSON_UNESCAPED_UNICODE);
 }
