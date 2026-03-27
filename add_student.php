@@ -328,42 +328,105 @@ try {
     }
 
     // officeOrCompanyId - маппинг названия в ID
-    if (!empty($post_data['officeOrCompanyId'])) {
-        // Маппинг названия офиса в ID
-        $office_mapping = [
-            'Выезд' => 7,
-            'Красная Пресня' => 4,
-            'Кр пресня' => 4,
-            'Курская' => 2,
-            'Ломоносовский проспект' => 45,
-            'Немчиновка' => 30,
-            'Октябрьская' => 5,
-            'Онлайн-платформа' => 36,
-            'Онлайн' => 36,
-            'онлайн' => 36,
-            'ООО Сфера-Строй М' => 66,
-            'Таганская/Цветной бульвар' => 53,
-            'Территория Смоленка' => 46
-        ];
+// officeOrCompanyId - маппинг названия в ID
+if (!empty($post_data['officeOrCompanyId'])) {
+    // Маппинг названия офиса в ID (с поддержкой разных регистров)
+    $office_mapping = [
+        'выезд' => 7,
+        'Выезд' => 7,
+        'ВЫЕЗД' => 7,
+        'Красная Пресня' => 4,
+        'красная пресня' => 4,
+        'КР красная пресня' => 4,
+        'Кр пресня' => 4,
+        'кр пресня' => 4,
+        'Курская' => 2,
+        'курская' => 2,
+        'Ломоносовский проспект' => 45,
+        'ломоносовский проспект' => 45,
+        'Немчиновка' => 30,
+        'немчиновка' => 30,
+        'Октябрьская' => 5,
+        'октябрьская' => 5,
+        'Онлайн-платформа' => 36,
+        'онлайн-платформа' => 36,
+        'Онлайн' => 36,
+        'онлайн' => 36,
+        'ООО Сфера-Строй М' => 66,
+        'ооо сфера-строй м' => 66,
+        'Таганская/Цветной бульвар' => 53,
+        'таганская/цветной бульвар' => 53,
+        'Территория Смоленка' => 46,
+        'территория смоленка' => 46
+    ];
 
-        $office_value = (string)$post_data['officeOrCompanyId'];
-
-        // Если это число, используем как ID
-        if (is_numeric($office_value)) {
-            $student_params['officeOrCompanyId'] = (int)$office_value;
-            log_message("officeOrCompanyId: используем числовой ID", ['value' => (int)$office_value]);
-        }
-        // Если строка, ищем в маппинге
-        elseif (isset($office_mapping[$office_value])) {
+    $office_value = trim((string)$post_data['officeOrCompanyId']);
+    
+    log_message("Маппинг officeOrCompanyId", [
+        'original_value' => $office_value,
+        'is_numeric' => is_numeric($office_value)
+    ], 'INFO');
+    
+    // Если это число, используем как ID
+    if (is_numeric($office_value)) {
+        $student_params['officeOrCompanyId'] = (int)$office_value;
+        log_message("officeOrCompanyId: используем числовой ID", [
+            'value' => (int)$office_value
+        ], 'INFO');
+    }
+    // Если строка, ищем в маппинге (регистронезависимо)
+    else {
+        // Пробуем найти точное совпадение
+        if (isset($office_mapping[$office_value])) {
             $student_params['officeOrCompanyId'] = $office_mapping[$office_value];
-            log_message("officeOrCompanyId: найден в маппинге", ['название' => $office_value, 'ID' => $office_mapping[$office_value]]);
-        }
-        // Если не найдено в маппинге, пробуем передать как есть
+            log_message("officeOrCompanyId: найдено точное совпадение", [
+                'название' => $office_value,
+                'ID' => $office_mapping[$office_value]
+            ], 'INFO');
+        } 
+        // Пробуем найти без учета регистра
         else {
-            $student_params['officeOrCompanyId'] = $office_value;
-            log_message("officeOrCompanyId: ⚠️ не найдено в маппинге, передаём как есть", ['value' => $office_value]);
+            $office_value_lower = mb_strtolower($office_value, 'UTF-8');
+            $found = false;
+            foreach ($office_mapping as $key => $id) {
+                if (mb_strtolower($key, 'UTF-8') === $office_value_lower) {
+                    $student_params['officeOrCompanyId'] = $id;
+                    $found = true;
+                    log_message("officeOrCompanyId: найдено совпадение без учета регистра", [
+                        'название' => $office_value,
+                        'найдено_по_ключу' => $key,
+                        'ID' => $id
+                    ], 'INFO');
+                    break;
+                }
+            }
+            
+            // Если не найдено, пробуем частичное совпадение
+            if (!$found) {
+                foreach ($office_mapping as $key => $id) {
+                    if (mb_stripos($office_value, $key, 0, 'UTF-8') !== false || 
+                        mb_stripos($key, $office_value, 0, 'UTF-8') !== false) {
+                        $student_params['officeOrCompanyId'] = $id;
+                        $found = true;
+                        log_message("officeOrCompanyId: найдено частичное совпадение", [
+                            'название' => $office_value,
+                            'найдено_по_ключу' => $key,
+                            'ID' => $id
+                        ], 'INFO');
+                        break;
+                    }
+                }
+            }
+            
+            if (!$found) {
+                log_message("officeOrCompanyId: ⚠️ не найдено в маппинге, передаём как есть", [
+                    'value' => $office_value
+                ], 'WARNING');
+                $student_params['officeOrCompanyId'] = $office_value;
+            }
         }
     }
+}
 
     // responsible_user - маппинг названия в значение
     if (!empty($post_data['responsible_user'])) {
