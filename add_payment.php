@@ -987,6 +987,27 @@ try {
     }
 
     // =========================================================================
+    // ОПРЕДЕЛЕНИЕ TYPE ПЛАТЕЖА ПО ВОРОНКЕ
+    // =========================================================================
+    $payment_type = null;
+    $pipeline_id = $LEAD['pipeline_id'] ?? null;
+
+    if ($pipeline_id) {
+        $payment_type = match ($pipeline_id) {
+            9719942 => 'языковой лагерь за рубежом',
+            8117846 => 'обучение за рубежом. индивидуальное',
+            default => null
+        };
+
+        if ($payment_type) {
+            log_payment_info("Определен type платежа по воронке", [
+                'pipeline_id' => $pipeline_id,
+                'payment_type' => $payment_type
+            ]);
+        }
+    }
+
+    // =========================================================================
     // ФОРМИРОВАНИЕ И ОТПРАВКА ОПЛАТЫ
     // =========================================================================
 
@@ -1012,7 +1033,9 @@ try {
         'date_iso'           => $date_iso,
         'payment_method_id'  => $payment_method_id,
         'payment_method_name' => $payment_method_id == 23 ? 'Тбанк (23)' : 'ПСБ (19)',
-        'payment_state'      => $payment_state
+        'payment_state'      => $payment_state,
+        'payment_type'       => $payment_type,
+        'pipeline_id'        => $pipeline_id
     ]);
 
     $payment_params = [
@@ -1023,6 +1046,10 @@ try {
         'state'             => $payment_state,
         'paymentMethodId'   => $payment_method_id
     ];
+
+    if ($payment_type) {
+        $payment_params['type'] = $payment_type;
+    }
 
     $result = call_hollyhop_api('AddPayment', $payment_params, $auth_key, $api_base_url);
 
