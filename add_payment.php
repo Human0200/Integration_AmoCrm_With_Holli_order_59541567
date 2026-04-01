@@ -58,6 +58,15 @@ const INDEX_ENDPOINT = 'https://srm.chinatutor.ru/index.php?payment_webhook=1';
  */
 function log_payment_message($message, $data = null, $level = 'INFO')
 {
+    $levels = ['DEBUG' => 0, 'INFO' => 1, 'WARNING' => 2, 'ERROR' => 3];
+    $current_level = $levels[strtoupper($level)] ?? 1;
+    $min_level = function_exists('get_config') ? (get_config('logging.level') ?? 'WARNING') : 'WARNING';
+    $min_level_num = $levels[strtoupper($min_level)] ?? 2;
+
+    if ($current_level < $min_level_num) {
+        return;
+    }
+
     $log_dir = __DIR__ . '/logs';
     $log_file = $log_dir . '/pay.log';
 

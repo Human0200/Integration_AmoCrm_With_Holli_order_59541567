@@ -77,7 +77,7 @@ $config = [
     ],
     'logging' => [
         'enabled' => true,
-        'level' => getenv('LOG_LEVEL') ?: 'INFO', // INFO, WARNING, ERROR
+        'level' => getenv('LOG_LEVEL') ?: 'WARNING', // DEBUG, INFO, WARNING, ERROR
         'log_dir' => __DIR__ . '/logs',
         'max_file_size' => 10485760, // 10MB
         'rotation_count' => 5
@@ -161,4 +161,3 @@ function init_directories() {
 
 return $config;
 ?>
-
