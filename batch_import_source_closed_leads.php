@@ -72,9 +72,12 @@ try {
     $options = bi_get_options();
     $statusMap = bi_load_source_status_map();
     $state = bi_load_state();
+    $processedLeadIds = !$options['force'] && isset($state['processed']) && is_array($state['processed'])
+        ? array_map('intval', array_keys($state['processed']))
+        : [];
     $leadIds = $options['lead_id'] > 0
         ? [$options['lead_id']]
-        : bi_fetch_source_lead_ids($statusMap, $options['limit']);
+        : bi_fetch_source_lead_ids($statusMap, $options['limit'], $processedLeadIds);
 
     $stats = [
         'found' => count($leadIds),
@@ -298,11 +301,12 @@ function bi_load_source_status_map(): array
     return $map;
 }
 
-function bi_fetch_source_lead_ids(array $statusMap, int $limit = 0): array
+function bi_fetch_source_lead_ids(array $statusMap, int $limit = 0, array $excludedLeadIds = []): array
 {
     $page = 1;
     $leadIds = [];
     $pageSize = 250;
+    $excludedLeadIds = array_fill_keys(array_map('intval', $excludedLeadIds), true);
 
     do {
         $query = ['page' => $page, 'limit' => $pageSize];
@@ -324,7 +328,7 @@ function bi_fetch_source_lead_ids(array $statusMap, int $limit = 0): array
         foreach ($pageItems as $lead) {
             $leadId = (int) ($lead['id'] ?? 0);
             $createdAt = (int) ($lead['created_at'] ?? 0);
-            if ($leadId > 0) {
+            if ($leadId > 0 && !isset($excludedLeadIds[$leadId])) {
                 $leadIds[$leadId] = [
                     'id' => $leadId,
                     'created_at' => $createdAt,
@@ -691,6 +695,8 @@ function bi_build_mapped_fields(array $sourceFields, array $fieldMap, string $en
             }
         }
 
+        $mappedValues = bi_normalize_target_field_values($targetFieldMetaById, $targetFieldId, $mappedValues);
+
         if ($mappedValues !== []) {
             $result[] = [
                 'field_id' => $targetFieldId,
@@ -700,6 +706,34 @@ function bi_build_mapped_fields(array $sourceFields, array $fieldMap, string $en
     }
 
     return $result;
+}
+
+function bi_normalize_target_field_values(array $targetFieldMetaById, int $targetFieldId, array $mappedValues): array
+{
+    if ($mappedValues === []) {
+        return [];
+    }
+
+    $targetField = $targetFieldMetaById[$targetFieldId] ?? null;
+    if (!is_array($targetField)) {
+        return $mappedValues;
+    }
+
+    $fieldType = (string) ($targetField['type'] ?? '');
+
+    if (in_array($fieldType, ['select', 'radiobutton'], true)) {
+        return [reset($mappedValues)];
+    }
+
+    if ($fieldType === 'checkbox') {
+        return [end($mappedValues)];
+    }
+
+    if (in_array($fieldType, ['text', 'numeric', 'date', 'date_time', 'url'], true)) {
+        return [reset($mappedValues)];
+    }
+
+    return $mappedValues;
 }
 
 function bi_is_target_field_available_for_pipeline(array $targetFieldMetaById, int $targetFieldId, int $pipelineId): bool

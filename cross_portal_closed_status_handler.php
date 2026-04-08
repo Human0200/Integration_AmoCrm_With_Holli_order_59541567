@@ -486,6 +486,8 @@ function cp_build_mapped_fields(array $sourceFields, array $fieldMap, string $en
             }
         }
 
+        $mappedValues = cp_normalize_target_field_values($targetFieldMetaById, $targetFieldId, $mappedValues);
+
         if (!empty($mappedValues)) {
             $result[] = [
                 'field_id' => $targetFieldId,
@@ -495,6 +497,34 @@ function cp_build_mapped_fields(array $sourceFields, array $fieldMap, string $en
     }
 
     return $result;
+}
+
+function cp_normalize_target_field_values(array $targetFieldMetaById, int $targetFieldId, array $mappedValues): array
+{
+    if ($mappedValues === []) {
+        return [];
+    }
+
+    $targetField = $targetFieldMetaById[$targetFieldId] ?? null;
+    if (!is_array($targetField)) {
+        return $mappedValues;
+    }
+
+    $fieldType = (string) ($targetField['type'] ?? '');
+
+    if (in_array($fieldType, ['select', 'radiobutton'], true)) {
+        return [reset($mappedValues)];
+    }
+
+    if ($fieldType === 'checkbox') {
+        return [end($mappedValues)];
+    }
+
+    if (in_array($fieldType, ['text', 'numeric', 'date', 'date_time', 'url'], true)) {
+        return [reset($mappedValues)];
+    }
+
+    return $mappedValues;
 }
 
 function cp_is_target_field_available_for_pipeline(array $targetFieldMetaById, int $targetFieldId, int $pipelineId): bool
