@@ -262,9 +262,20 @@ function cp_create_target_lead(array $sourceLead, string $classification): int
     $sourceLeadName = trim((string) ($sourceLead['name'] ?? 'Без названия'));
     $mappedCustomFields = cp_build_target_custom_fields($sourceLead);
     $sourceContact = cp_extract_primary_source_contact($sourceLead);
+    $targetLeadName = $sourceLeadName . ' [source #' . $sourceLeadId . ']';
+
+    $existingLeadId = cp_find_existing_target_lead_id($sourceLeadId, $targetLeadName);
+    if ($existingLeadId > 0) {
+        cp_log('INFO', 'Сделка уже существует на целевом портале, повторное создание пропущено', [
+            'source_lead_id' => $sourceLeadId,
+            'target_lead_id' => $existingLeadId,
+        ]);
+
+        return $existingLeadId;
+    }
 
     $targetLead = [
-        'name' => $sourceLeadName . ' [source #' . $sourceLeadId . ']',
+        'name' => $targetLeadName,
         'price' => (int) ($sourceLead['price'] ?? 0),
         'pipeline_id' => TARGET_AMO_PIPELINE_ID,
         'status_id' => TARGET_AMO_STATUS_ID,
@@ -272,14 +283,6 @@ function cp_create_target_lead(array $sourceLead, string $classification): int
 
     if (!empty($mappedCustomFields)) {
         $targetLead['custom_fields_values'] = $mappedCustomFields;
-    }
-
-    if (!empty($sourceContact)) {
-        $targetLead['_embedded'] = [
-            'contacts' => [
-                cp_build_target_contact_payload($sourceContact)
-            ]
-        ];
     }
 
     $targetPayload = [$targetLead];
@@ -290,11 +293,22 @@ function cp_create_target_lead(array $sourceLead, string $classification): int
         'contact_transferred' => !empty($sourceContact),
     ]);
 
-    $response = post_or_patch($subdomain, $targetPayload, '/api/v4/leads', $data, 'POST');
+    $response = cp_target_request('POST', '/api/v4/leads', $targetPayload);
     $createdLeadId = (int) ($response['_embedded']['leads'][0]['id'] ?? 0);
 
     if ($createdLeadId <= 0) {
         throw new RuntimeException('Целевой портал не вернул ID созданной сделки');
+    }
+
+    if (!empty($sourceContact)) {
+        $targetContactId = cp_create_target_contact($sourceContact);
+        cp_link_contact_to_target_lead($createdLeadId, $targetContactId);
+
+        cp_log('INFO', 'Контакт создан и привязан к сделке на целевом портале', [
+            'source_lead_id' => $sourceLeadId,
+            'target_lead_id' => $createdLeadId,
+            'target_contact_id' => $targetContactId,
+        ]);
     }
 
     return $createdLeadId;
@@ -387,6 +401,60 @@ function cp_build_target_contact_payload(array $sourceContact): array
     }
 
     return $contact;
+}
+
+function cp_create_target_contact(array $sourceContact): int
+{
+    $payload = [cp_build_target_contact_payload($sourceContact)];
+    $response = cp_target_request('POST', '/api/v4/contacts', $payload);
+    $contactId = (int) ($response['_embedded']['contacts'][0]['id'] ?? 0);
+
+    if ($contactId <= 0) {
+        throw new RuntimeException('Целевой портал не вернул ID созданного контакта');
+    }
+
+    return $contactId;
+}
+
+function cp_link_contact_to_target_lead(int $leadId, int $contactId): void
+{
+    if ($leadId <= 0 || $contactId <= 0) {
+        throw new RuntimeException('Некорректные ID сделки или контакта для привязки');
+    }
+
+    cp_target_request('POST', '/api/v4/leads/' . $leadId . '/link', [
+        [
+            'to_entity_id' => $contactId,
+            'to_entity_type' => 'contacts',
+        ],
+    ]);
+}
+
+function cp_find_existing_target_lead_id(int $sourceLeadId, string $expectedName): int
+{
+    if ($sourceLeadId <= 0) {
+        return 0;
+    }
+
+    $marker = '[source #' . $sourceLeadId . ']';
+    $response = cp_target_request('GET', '/api/v4/leads?query=' . urlencode($marker) . '&limit=50');
+    $leads = $response['_embedded']['leads'] ?? [];
+
+    if (!is_array($leads)) {
+        return 0;
+    }
+
+    foreach ($leads as $lead) {
+        $leadId = (int) ($lead['id'] ?? 0);
+        $leadName = trim((string) ($lead['name'] ?? ''));
+        $pipelineId = (int) ($lead['pipeline_id'] ?? 0);
+
+        if ($leadId > 0 && $pipelineId === TARGET_AMO_PIPELINE_ID && $leadName === $expectedName) {
+            return $leadId;
+        }
+    }
+
+    return 0;
 }
 
 function cp_build_target_custom_fields(array $sourceLead): array
@@ -556,10 +624,8 @@ function cp_get_target_field_meta_by_id(string $entityType): array
         return $cache[$entityType];
     }
 
-    global $subdomain, $data;
-
     $endpoint = $entityType === 'contacts' ? '/api/v4/contacts/custom_fields' : '/api/v4/leads/custom_fields';
-    $response = get($subdomain, $endpoint, $data);
+    $response = cp_target_request('GET', $endpoint);
     $fields = $response['_embedded']['custom_fields'] ?? [];
 
     $byId = [];
@@ -651,6 +717,66 @@ function cp_source_request(string $path): array
     $decoded = json_decode((string) $raw, true);
     if (!is_array($decoded)) {
         throw new RuntimeException('Источник вернул некорректный JSON');
+    }
+
+    return $decoded;
+}
+
+function cp_target_request(string $method, string $path, ?array $payload = null): array
+{
+    global $subdomain, $data;
+
+    $url = 'https://' . $subdomain . '.amocrm.ru' . $path;
+    $headers = [
+        'Authorization: Bearer ' . ($data['access_token'] ?? ''),
+        'Content-Type: application/json',
+    ];
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_USERAGENT => 'amoCRM-oAuth-client/1.0',
+        CURLOPT_SSL_VERIFYPEER => 1,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_CUSTOMREQUEST => strtoupper($method),
+    ]);
+
+    if ($payload !== null) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    }
+
+    $raw = curl_exec($ch);
+    $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError !== '') {
+        throw new RuntimeException('Ошибка запроса к целевому порталу: ' . $curlError);
+    }
+
+    if ($httpCode < 200 || $httpCode > 204) {
+        cp_log('ERROR', 'Целевой портал вернул ошибку', [
+            'method' => strtoupper($method),
+            'path' => $path,
+            'http_code' => $httpCode,
+            'payload' => $payload,
+            'response' => (string) $raw,
+        ]);
+
+        throw new RuntimeException('Целевой портал вернул HTTP ' . $httpCode . ': ' . (string) $raw);
+    }
+
+    if ($raw === '' || $raw === null) {
+        return [];
+    }
+
+    $decoded = json_decode((string) $raw, true);
+    if (!is_array($decoded)) {
+        throw new RuntimeException('Целевой портал вернул некорректный JSON');
     }
 
     return $decoded;
