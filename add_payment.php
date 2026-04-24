@@ -49,6 +49,10 @@ require_once __DIR__ . '/config.php';
 const AMO_FIELD_PROFILE_LINK = 1630807;
 const AMO_CONTACT_FIELD_PHONE = 1138327;
 const AMO_CONTACT_FIELD_EMAIL = 1138329;
+const RECENT_SEARCH_MONTHS = 3;
+const RECENT_SEARCH_PAGE_LIMIT = 8;
+const EXTENDED_SEARCH_MONTHS = 6;
+const EXTENDED_SEARCH_PAGE_LIMIT = 6;
 
 // Используем index.php — он содержит полную логику поиска и создания студента
 const INDEX_ENDPOINT = 'https://srm.chinatutor.ru/index.php?payment_webhook=1';
@@ -110,165 +114,149 @@ function log_payment_debug($message, $data = null)
     log_payment_message($message, $data, 'DEBUG');
 }
 
-/**
- * Ищет сделку, связанную со счетом, через API связей AmoCRM.
- *
- * Стратегия:
- * 1. Быстрый проход по открытым сделкам за последние 6 месяцев.
- * 2. Если не нашли — расширенный проход по всем сделкам за последние 18 месяцев.
- *
- * Вместо жесткого лимита страниц используем временной бюджет, чтобы
- * не отбрасывать валидные старые страницы на больших аккаунтах.
- */
-function find_lead_by_catalog_link(string $subdomain, array $data, int $catalog_element_id, ?int $catalog_id = null): ?array
+function extract_payer_contact_id_from_catalog_element(array $catalogElement): ?int
 {
-    $leads_pool_size = 250;
-    $started_at = microtime(true);
-    $time_budget_seconds = 90;
-    $total_processed = 0;
-    $total_checked = 0;
-    $strategy_summaries = [];
+    foreach ($catalogElement['custom_fields_values'] ?? [] as $field) {
+        $fieldCode = $field['field_code'] ?? $field['code'] ?? null;
+        if ($fieldCode !== 'PAYER') {
+            continue;
+        }
 
-    $strategies = [
-        [
-            'name' => 'open_recent',
-            'label' => 'Поиск счета среди открытых сделок за 6 месяцев',
-            'created_from' => time() - (6 * 30 * 24 * 60 * 60),
-            'only_open' => true,
-        ],
-        [
-            'name' => 'all_extended',
-            'label' => 'Расширенный поиск счета среди всех сделок за 18 месяцев',
-            'created_from' => time() - (18 * 30 * 24 * 60 * 60),
-            'only_open' => false,
-        ],
-    ];
-
-    foreach ($strategies as $strategy) {
-        $page = 1;
-        $strategy_processed = 0;
-        $strategy_checked = 0;
-
-        log_payment_info($strategy['label'], [
-            'catalog_element_id' => $catalog_element_id,
-            'catalog_id' => $catalog_id,
-            'strategy' => $strategy['name'],
-        ]);
-
-        do {
-            if ((microtime(true) - $started_at) >= $time_budget_seconds) {
-                log_payment_warning("Прерван поиск связанной сделки по тайм-бюджету", [
-                    'catalog_element_id' => $catalog_element_id,
-                    'catalog_id' => $catalog_id,
-                    'elapsed_seconds' => round(microtime(true) - $started_at, 2),
-                    'total_processed' => $total_processed,
-                    'total_checked' => $total_checked,
-                    'strategy' => $strategy['name'],
-                    'page' => $page,
-                ]);
-                break 2;
+        foreach ($field['values'] ?? [] as $valueRow) {
+            $value = $valueRow['value'] ?? null;
+            if (
+                is_array($value) &&
+                ($value['entity_type'] ?? null) === 'contacts' &&
+                !empty($value['entity_id'])
+            ) {
+                return (int) $value['entity_id'];
             }
-
-            $api_url = "/api/v4/leads?limit={$leads_pool_size}&page={$page}&filter[created_at][from]={$strategy['created_from']}&order[created_at]=desc";
-            $LEADS_RESPONSE = get($subdomain, $api_url, $data);
-
-            if (empty($LEADS_RESPONSE['_embedded']['leads']) || !is_array($LEADS_RESPONSE['_embedded']['leads'])) {
-                break;
-            }
-
-            $leads = $LEADS_RESPONSE['_embedded']['leads'];
-            $leads_in_page = count($leads);
-            $total_processed += $leads_in_page;
-            $strategy_processed += $leads_in_page;
-
-            if ($strategy['only_open']) {
-                $leads = array_filter($leads, static function ($lead) {
-                    return empty($lead['closed_at'] ?? null);
-                });
-            }
-
-            $page_lead_ids = array_values(array_filter(array_map(static fn($lead) => $lead['id'] ?? null, $leads)));
-
-            if (!empty($page_lead_ids)) {
-                $lead_chunks = array_chunk($page_lead_ids, 50);
-
-                foreach ($lead_chunks as $lead_chunk) {
-                    $query_parts = [];
-
-                    foreach ($lead_chunk as $lead_id) {
-                        $query_parts[] = 'filter[entity_id][]=' . urlencode((string) $lead_id);
-                    }
-
-                    $query_parts[] = 'filter[to_entity_id]=' . urlencode((string) $catalog_element_id);
-                    $query_parts[] = 'filter[to_entity_type]=' . urlencode('catalog_elements');
-                    if ($catalog_id) {
-                        $query_parts[] = 'filter[to_catalog_id]=' . urlencode((string) $catalog_id);
-                    }
-
-                    $links_api_url = "/api/v4/leads/links?" . implode('&', $query_parts);
-                    $LINKS_RESPONSE = get($subdomain, $links_api_url, $data);
-
-                    $chunk_checked = count($lead_chunk);
-                    $total_checked += $chunk_checked;
-                    $strategy_checked += $chunk_checked;
-
-                    if (empty($LINKS_RESPONSE['_embedded']['links']) || !is_array($LINKS_RESPONSE['_embedded']['links'])) {
-                        continue;
-                    }
-
-                    foreach ($LINKS_RESPONSE['_embedded']['links'] as $found_link) {
-                        $lead_id_from_link = (int) ($found_link['entity_id'] ?? 0);
-                        $link_catalog_element_id = (int) ($found_link['to_entity_id'] ?? 0);
-                        $link_catalog_id = (int) ($found_link['metadata']['catalog_id'] ?? 0);
-
-                        if (
-                            $lead_id_from_link > 0 &&
-                            ($found_link['entity_type'] ?? null) === 'leads' &&
-                            ($found_link['to_entity_type'] ?? null) === 'catalog_elements' &&
-                            $link_catalog_element_id === $catalog_element_id &&
-                            (!$catalog_id || !$link_catalog_id || $link_catalog_id === $catalog_id)
-                        ) {
-                            log_payment_info("✓ Сделка найдена через API links", [
-                                'lead_id' => $lead_id_from_link,
-                                'catalog_element_id' => $catalog_element_id,
-                                'catalog_id' => $catalog_id,
-                                'strategy' => $strategy['name'],
-                                'page' => $page,
-                                'total_checked' => $total_checked,
-                                'total_processed' => $total_processed,
-                            ]);
-
-                            return [
-                                'lead_id' => $lead_id_from_link,
-                                'total_processed' => $total_processed,
-                                'total_checked' => $total_checked,
-                                'strategy' => $strategy['name'],
-                            ];
-                        }
-                    }
-                }
-            }
-
-            if ($leads_in_page < $leads_pool_size) {
-                break;
-            }
-
-            $page++;
-        } while (true);
-
-        $strategy_summaries[] = [
-            'strategy' => $strategy['name'],
-            'processed' => $strategy_processed,
-            'checked' => $strategy_checked,
-        ];
+        }
     }
 
-    log_payment_warning("Сделка не найдена через API links", [
+    return null;
+}
+
+function fetch_contact_lead_ids(string $subdomain, array $data, int $contactId): array
+{
+    $response = get($subdomain, '/api/v4/contacts/' . $contactId . '?with=leads', $data);
+    $leads = $response['_embedded']['leads'] ?? [];
+
+    if (!is_array($leads) || empty($leads)) {
+        return [];
+    }
+
+    return array_values(array_filter(array_map(static function ($lead) {
+        $leadId = (int) ($lead['id'] ?? 0);
+        return $leadId > 0 ? $leadId : null;
+    }, $leads)));
+}
+
+function find_lead_by_catalog_link(
+    string $subdomain,
+    array $data,
+    int $catalog_element_id,
+    ?int $catalog_id = null,
+    ?array $catalogElement = null
+): ?array {
+    $started_at = microtime(true);
+
+    if ($catalogElement === null) {
+        if (!$catalog_id) {
+            return null;
+        }
+
+        $catalogElement = get($subdomain, '/api/v4/catalogs/' . $catalog_id . '/elements/' . $catalog_element_id, $data);
+    }
+
+    $payerContactId = extract_payer_contact_id_from_catalog_element($catalogElement);
+
+    log_payment_info("Поиск сделки по счету через плательщика счета", [
         'catalog_element_id' => $catalog_element_id,
         'catalog_id' => $catalog_id,
-        'total_processed' => $total_processed,
-        'total_checked' => $total_checked,
-        'strategies' => $strategy_summaries,
+        'payer_contact_id' => $payerContactId,
+    ]);
+
+    if (!$payerContactId) {
+        log_payment_warning("У счета не найден contact_id плательщика", [
+            'catalog_element_id' => $catalog_element_id,
+            'catalog_id' => $catalog_id,
+        ]);
+        return null;
+    }
+
+    $candidateLeadIds = fetch_contact_lead_ids($subdomain, $data, $payerContactId);
+
+    log_payment_info("Получены сделки контакта-плательщика", [
+        'catalog_element_id' => $catalog_element_id,
+        'catalog_id' => $catalog_id,
+        'payer_contact_id' => $payerContactId,
+        'candidate_leads_count' => count($candidateLeadIds),
+        'candidate_lead_ids' => $candidateLeadIds,
+    ]);
+
+    if (empty($candidateLeadIds)) {
+        return null;
+    }
+
+    $checkedLeads = 0;
+    foreach (array_chunk($candidateLeadIds, 50) as $leadChunk) {
+        $queryParts = [];
+
+        foreach ($leadChunk as $leadId) {
+            $queryParts[] = 'filter[entity_id][]=' . urlencode((string) $leadId);
+        }
+
+        $queryParts[] = 'filter[to_entity_id]=' . urlencode((string) $catalog_element_id);
+        $queryParts[] = 'filter[to_entity_type]=' . urlencode('catalog_elements');
+        if ($catalog_id) {
+            $queryParts[] = 'filter[to_catalog_id]=' . urlencode((string) $catalog_id);
+        }
+
+        $linksApiUrl = '/api/v4/leads/links?' . implode('&', $queryParts);
+        $linksResponse = get($subdomain, $linksApiUrl, $data);
+
+        $checkedLeads += count($leadChunk);
+
+        if (empty($linksResponse['_embedded']['links']) || !is_array($linksResponse['_embedded']['links'])) {
+            continue;
+        }
+
+        foreach ($linksResponse['_embedded']['links'] as $foundLink) {
+            $leadIdFromLink = (int) ($foundLink['entity_id'] ?? 0);
+            $linkCatalogElementId = (int) ($foundLink['to_entity_id'] ?? 0);
+            $linkCatalogId = (int) ($foundLink['metadata']['catalog_id'] ?? 0);
+
+            if (
+                $leadIdFromLink > 0 &&
+                ($foundLink['entity_type'] ?? null) === 'leads' &&
+                ($foundLink['to_entity_type'] ?? null) === 'catalog_elements' &&
+                $linkCatalogElementId === $catalog_element_id &&
+                (!$catalog_id || !$linkCatalogId || $linkCatalogId === $catalog_id)
+            ) {
+                log_payment_info("✓ Сделка найдена через плательщика счета и API links", [
+                    'lead_id' => $leadIdFromLink,
+                    'catalog_element_id' => $catalog_element_id,
+                    'catalog_id' => $catalog_id,
+                    'payer_contact_id' => $payerContactId,
+                    'checked_leads' => $checkedLeads,
+                    'elapsed_seconds' => round(microtime(true) - $started_at, 2),
+                ]);
+
+                return [
+                    'lead_id' => $leadIdFromLink,
+                    'checked_leads' => $checkedLeads,
+                    'strategy' => 'payer_contact_links',
+                ];
+            }
+        }
+    }
+
+    log_payment_warning("Сделка не найдена через плательщика счета", [
+        'catalog_element_id' => $catalog_element_id,
+        'catalog_id' => $catalog_id,
+        'payer_contact_id' => $payerContactId,
+        'candidate_leads_count' => count($candidateLeadIds),
         'elapsed_seconds' => round(microtime(true) - $started_at, 2),
     ]);
 
@@ -448,9 +436,8 @@ function call_index_for_student(int $lead_id, array $lead, string $subdomain, ar
         'response_preview' => substr((string) $response, 0, 300)
     ]);
 
-    // index.php не возвращает чистый JSON (содержит echo для отладки),
-    // поэтому после его выполнения читаем профиль студента из обновлённой сделки AmoCRM.
-    // index.php записывает ссылку на профиль в поле AMO_FIELD_PROFILE_LINK сделки.
+    // После вызова index.php проверяем, записал ли он ссылку на профиль
+    // обратно в сделку AmoCRM.
 
     // Небольшая пауза чтобы index.php успел записать данные
     sleep(2);
@@ -630,6 +617,14 @@ try {
                 }
             }
 
+            log_payment_info("Извлечены поля счета из вебхука", [
+                'catalog_element_id' => $catalog_element_id,
+                'catalog_id' => $catalog_id,
+                'bill_status' => $bill_status,
+                'bill_price' => $bill_price,
+                'bill_payment_date' => $bill_payment_date,
+            ]);
+
             // Проверяем, что счет оплачен
             if ($bill_status !== 'Оплачен' && strpos(strtolower($bill_status ?? ''), 'оплач') === false) {
                 log_payment_info("Счет не оплачен, пропускаем обработку", ['bill_status' => $bill_status]);
@@ -651,17 +646,19 @@ try {
             $api_url = '/api/v4/catalogs/' . $catalog_id . '/elements/' . $catalog_element_id;
             $CATALOG_ELEMENT = get($subdomain, $api_url, $data);
 
-            // Ищем связанную сделку через API links без жесткого лимита страниц.
+            // Единственный путь поиска: через официальный API связей amoCRM.
             $lead_id_from_catalog = null;
 
             try {
-                $lead_search_result = find_lead_by_catalog_link($subdomain, $data, $catalog_element_id, $catalog_id);
+                $lead_search_result = find_lead_by_catalog_link($subdomain, $data, $catalog_element_id, $catalog_id, $CATALOG_ELEMENT);
 
                 if ($lead_search_result) {
                     $lead_id_from_catalog = (int) ($lead_search_result['lead_id'] ?? 0);
                     log_payment_info("Сделка найдена", [
                         'lead_id' => $lead_id_from_catalog,
                         'search_strategy' => $lead_search_result['strategy'] ?? null,
+                        'checked_leads' => $lead_search_result['checked_leads'] ?? null,
+                        'source_url' => $lead_search_result['source_url'] ?? null,
                         'total_checked' => $lead_search_result['total_checked'] ?? null,
                         'total_processed' => $lead_search_result['total_processed'] ?? null,
                     ]);
