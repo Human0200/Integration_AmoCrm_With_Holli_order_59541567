@@ -159,6 +159,127 @@ function call_hollyhop_api($function_name, $params, $auth_key, $api_base_url)
     return $result;
 }
 
+function normalize_extra_field_name($name)
+{
+    $name = trim((string)$name);
+    $name = str_replace('ё', 'е', $name);
+    $name = preg_replace('/\s+/u', ' ', $name);
+
+    return mb_strtolower($name, 'UTF-8');
+}
+
+function build_student_extra_fields_from_post_data($post_data)
+{
+    $extra_fields = [];
+
+    if (!empty($post_data['childName'])) {
+        $extra_fields[] = [
+            'name' => 'ФИО ребенка',
+            'value' => trim((string)$post_data['childName'])
+        ];
+    }
+
+    if (!empty($post_data['childBirthDate'])) {
+        $extra_fields[] = [
+            'name' => 'Дата рождения ребенка',
+            'value' => trim((string)$post_data['childBirthDate'])
+        ];
+    }
+
+    return $extra_fields;
+}
+
+function split_full_name($full_name)
+{
+    $full_name = trim((string)$full_name);
+    if ($full_name === '') {
+        return ['firstName' => '', 'lastName' => '', 'middleName' => ''];
+    }
+
+    $parts = preg_split('/\s+/u', $full_name) ?: [];
+
+    return [
+        'firstName' => $parts[0] ?? '',
+        'lastName' => $parts[1] ?? '',
+        'middleName' => count($parts) > 2 ? implode(' ', array_slice($parts, 2)) : ''
+    ];
+}
+
+function build_agent_contacts_payload($student_info, $post_data, $client_id)
+{
+    $parent_name = trim((string)($post_data['parentName'] ?? ''));
+    $parent_email = trim((string)($post_data['parentEmail'] ?? $post_data['email'] ?? ''));
+
+    if ($parent_name === '' && $parent_email === '') {
+        return null;
+    }
+
+    $existing_agents = [];
+    if (is_array($student_info) && isset($student_info['Agents']) && is_array($student_info['Agents'])) {
+        foreach ($student_info['Agents'] as $agent) {
+            if (!is_array($agent)) {
+                continue;
+            }
+
+            $existing_agents[] = [
+                'firstName' => trim((string)($agent['FirstName'] ?? $agent['firstName'] ?? '')),
+                'middleName' => trim((string)($agent['MiddleName'] ?? $agent['middleName'] ?? '')),
+                'lastName' => trim((string)($agent['LastName'] ?? $agent['lastName'] ?? '')),
+                'whoIs' => trim((string)($agent['WhoIs'] ?? $agent['whoIs'] ?? '')),
+                'mobile' => trim((string)($agent['Mobile'] ?? $agent['mobile'] ?? '')),
+                'useMobileBySystem' => (bool)($agent['UseMobileBySystem'] ?? $agent['useMobileBySystem'] ?? false),
+                'phone' => trim((string)($agent['Phone'] ?? $agent['phone'] ?? '')),
+                'eMail' => trim((string)($agent['EMail'] ?? $agent['eMail'] ?? '')),
+                'useEMailBySystem' => (bool)($agent['UseEMailBySystem'] ?? $agent['useEMailBySystem'] ?? false),
+                'jobOrStudyPlace' => trim((string)($agent['JobOrStudyPlace'] ?? $agent['jobOrStudyPlace'] ?? '')),
+                'position' => trim((string)($agent['Position'] ?? $agent['position'] ?? '')),
+                'isCustomer' => (bool)($agent['IsCustomer'] ?? $agent['isCustomer'] ?? false),
+                'birthday' => trim((string)($agent['Birthday'] ?? $agent['birthday'] ?? ''))
+            ];
+        }
+    }
+
+    $parsed_parent_name = split_full_name($parent_name);
+    $new_parent = [
+        'firstName' => $parsed_parent_name['firstName'],
+        'middleName' => $parsed_parent_name['middleName'],
+        'lastName' => $parsed_parent_name['lastName'],
+        'whoIs' => 'Родитель',
+        'mobile' => trim((string)($post_data['phone'] ?? '')),
+        'useMobileBySystem' => false,
+        'phone' => trim((string)($post_data['phone'] ?? '')),
+        'eMail' => $parent_email,
+        'useEMailBySystem' => false,
+        'isCustomer' => true
+    ];
+
+    $agents = [];
+    $replaced = false;
+    foreach ($existing_agents as $agent) {
+        $same_email = $parent_email !== '' && ($agent['eMail'] ?? '') === $parent_email;
+        $same_customer = !empty($agent['isCustomer']);
+
+        if (!$replaced && ($same_email || $same_customer)) {
+            $agents[] = array_merge($agent, array_filter($new_parent, function ($value) {
+                return $value !== '';
+            }));
+            $replaced = true;
+            continue;
+        }
+
+        $agents[] = $agent;
+    }
+
+    if (!$replaced) {
+        $agents[] = $new_parent;
+    }
+
+    return [
+        'studentClientId' => $client_id,
+        'agents' => $agents
+    ];
+}
+
 /**
  * Основная логика скрипта
  */
@@ -219,10 +340,18 @@ try {
         }
     }
 
+    $student_name = !empty($post_data['childName'])
+        ? split_full_name($post_data['childName'])
+        : [
+            'firstName' => !empty($post_data['firstName']) ? trim($post_data['firstName']) : '',
+            'lastName' => !empty($post_data['lastName']) ? trim($post_data['lastName']) : '',
+            'middleName' => !empty($post_data['middleName']) ? trim($post_data['middleName']) : ''
+        ];
+
     // Подготавливаем параметры для API
     // Если имя или фамилия не указаны, используем прочерки
-    $firstName = !empty($post_data['firstName']) ? trim($post_data['firstName']) : '-';
-    $lastName = !empty($post_data['lastName']) ? trim($post_data['lastName']) : '-';
+    $firstName = $student_name['firstName'] !== '' ? $student_name['firstName'] : '-';
+    $lastName = $student_name['lastName'] !== '' ? $student_name['lastName'] : '-';
 
     $student_params = [
         'firstName' => $firstName,
@@ -236,12 +365,19 @@ try {
 
     // Базовые опциональные поля с маппингом имён (input => API)
     $optional_fields = [
-        'middleName' => 'patronymic',
-        'birthDate' => 'birthDate',
+        'middleName' => 'middleName',
+        'birthDate' => 'birthday',
         'phone' => 'phone',
         'email' => 'email',
         'locationId' => 'locationId'
     ];
+
+    if (!empty($student_name['middleName'])) {
+        $post_data['middleName'] = $student_name['middleName'];
+    }
+    if (empty($post_data['birthDate']) && !empty($post_data['childBirthDate'])) {
+        $post_data['birthDate'] = $post_data['childBirthDate'];
+    }
 
     foreach ($optional_fields as $post_field => $api_field) {
         if (!empty($post_data[$post_field])) {
@@ -453,7 +589,7 @@ if (!empty($post_data['officeOrCompanyId'])) {
     }
 
     if (!empty($post_data['Status'])) {
-        $student_params['Status'] = $post_data['Status'];
+        $student_params['status'] = $post_data['Status'];
     }
 
     // Логируем все параметры для отладки
@@ -1051,6 +1187,49 @@ if (!empty($post_data['officeOrCompanyId'])) {
         $student_id_from_api = $client_id;
     }
 
+    if ($client_id && (!empty($post_data['childName']) || !empty($post_data['birthDate']) || !empty($post_data['childBirthDate']))) {
+        $edit_personal_params = [
+            'studentClientId' => $client_id,
+            'firstName' => $firstName,
+            'lastName' => $lastName
+        ];
+
+        if (!empty($student_name['middleName'])) {
+            $edit_personal_params['middleName'] = $student_name['middleName'];
+        }
+        if ($mapped_gender !== null) {
+            $edit_personal_params['gender'] = $mapped_gender;
+        }
+        if (!empty($post_data['birthDate'])) {
+            $edit_personal_params['birthday'] = $post_data['birthDate'];
+        }
+
+        try {
+            log_message("Обновление персональных данных ученика через EditPersonal", $edit_personal_params, 'INFO');
+            $edit_personal_result = call_hollyhop_api('EditPersonal', $edit_personal_params, $auth_key, $api_base_url);
+            log_message("EditPersonal выполнен успешно", $edit_personal_result, 'INFO');
+        } catch (Exception $e) {
+            log_message("Ошибка при обновлении персональных данных через EditPersonal", [
+                'error' => $e->getMessage(),
+                'client_id' => $client_id
+            ], 'WARNING');
+        }
+    }
+
+    $agent_contacts_payload = build_agent_contacts_payload($student_info, $post_data, $client_id);
+    if ($agent_contacts_payload !== null) {
+        try {
+            log_message("Обновление контактного лица через EditAgentContacts", $agent_contacts_payload, 'INFO');
+            $edit_agent_contacts_result = call_hollyhop_api('EditAgentContacts', $agent_contacts_payload, $auth_key, $api_base_url);
+            log_message("EditAgentContacts выполнен успешно", $edit_agent_contacts_result, 'INFO');
+        } catch (Exception $e) {
+            log_message("Ошибка при обновлении контактного лица через EditAgentContacts", [
+                'error' => $e->getMessage(),
+                'client_id' => $client_id
+            ], 'WARNING');
+        }
+    }
+
     // Формируем ответ в новом формате
     log_message("ШАГ 9: Формирование ответа", [
         'student_id_from_api' => $student_id_from_api,
@@ -1086,6 +1265,11 @@ if (!empty($post_data['officeOrCompanyId'])) {
             'phone' => $existing_student['Phone'] ?? $existing_student['phone'] ?? $existing_student['Mobile'] ?? $existing_student['mobile'] ?? ''
         ];
     }
+
+    $student_extra_fields = build_student_extra_fields_from_post_data($post_data);
+    $student_extra_field_names = array_map(function ($field) {
+        return normalize_extra_field_name($field['name'] ?? '');
+    }, $student_extra_fields);
 
     // Обновляем поле "Сделки АМО" в Hollyhop, если передан lead_id из AmoCRM
     log_message("ШАГ 10: Обновление поля 'Сделки АМО' в Hollyhop", [
@@ -1271,6 +1455,10 @@ if (!empty($post_data['officeOrCompanyId'])) {
                                 'is_exact_match' => ($field_name_normalized === 'Сделки АМО' || $field_name_normalized === 'Ссылки АМО')
                             ]);
                         } else {
+                            if (in_array(normalize_extra_field_name($field_name), $student_extra_field_names, true)) {
+                                continue;
+                            }
+
                             // Сохраняем все остальные поля
                             $all_extra_fields[] = [
                                 'name' => $field_name,
@@ -1373,6 +1561,10 @@ if (!empty($post_data['officeOrCompanyId'])) {
                     'value' => $new_amo_deals_value
                 ];
 
+                foreach ($student_extra_fields as $extra_field) {
+                    $all_extra_fields[] = $extra_field;
+                }
+
                 // Обновляем все поля через EditUserExtraFields
                 // ВАЖНО: Метод требует отправки ВСЕХ полей сразу, иначе они будут удалены
                 $update_success = false;
@@ -1382,7 +1574,8 @@ if (!empty($post_data['officeOrCompanyId'])) {
                     'clientId' => $client_id,
                     'total_fields_to_send' => count($all_extra_fields),
                     'amo_deals_field_value' => $new_amo_deals_value,
-                    'amo_deals_field_value_length' => strlen($new_amo_deals_value)
+                    'amo_deals_field_value_length' => strlen($new_amo_deals_value),
+                    'student_extra_fields' => $student_extra_fields
                 ]);
 
                 try {

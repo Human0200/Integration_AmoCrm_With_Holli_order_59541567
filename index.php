@@ -31,6 +31,8 @@ const AMO_FIELD_CONTRACT_LINK     = 1632483;
 
 const AMO_CONTACT_FIELD_PHONE = 1138327;
 const AMO_CONTACT_FIELD_EMAIL = 1138329;
+const AMO_CONTACT_FIELD_CHILD_NAME = 1635263;
+const AMO_CONTACT_FIELD_CHILD_BIRTHDATE = 1635265;
 
 const HOLLYHOP_TIMEOUT         = 120;
 const HOLLYHOP_CONNECT_TIMEOUT = 15;
@@ -286,22 +288,157 @@ function handleOkiDokiSignedContract(array $okiData): void
 {
     global $subdomain, $data;
 
-    $leadId = $okiData['lead_id'] ?? null;
-    $fio    = $okiData['extra_fields']['ФИО клиента'] ?? '';
-    $email  = $okiData['extra_fields']['E-Mail клиента'] ?? '';
+    $leadId = (int) ($okiData['lead_id'] ?? 0);
+    $parentFio = trim((string) okiGetExtraField($okiData, ['ФИО клиента']));
+    $email = trim((string) okiGetExtraField($okiData, ['E-Mail клиента', 'Email клиента']));
+    $childFio = trim((string) okiGetExtraField($okiData, ['ФИО ребенка', 'ФИО ребёнка']));
+    $childBirthDateRaw = trim((string) okiGetExtraField($okiData, ['Дата рождения ребенка', 'Дата рождения ребёнка']));
+    $languageRaw = trim((string) okiGetExtraField($okiData, ['Язык', 'Иностранный язык', 'Язык ребенка', 'Язык ребёнка']));
+    $levelRaw = trim((string) okiGetExtraField($okiData, ['Уровень языка', 'Уровень владения языком']));
 
     if (!$leadId) {
         log_warning("OkiDoki вебхук без lead_id", $okiData, 'index.php');
         return;
     }
 
-    log_info("Договор подписан! ФИО: $fio, Email: $email", $okiData, 'index.php');
+    $normalizedLevel = normalizeOkiLevelForAmo($levelRaw);
+    $normalizedLanguage = normalizeOkiLanguageForAmo($languageRaw);
+    $childBirthDate = normalizeOkiDateForAmo($childBirthDateRaw);
+
+    log_info("Договор подписан, обновляем данные из OkiDoki", [
+        'lead_id' => $leadId,
+        'parent_fio' => $parentFio,
+        'email' => $email,
+        'child_fio' => $childFio,
+        'child_birth_date' => $childBirthDate,
+        'language_raw' => $languageRaw,
+        'language' => $normalizedLanguage,
+        'level_raw' => $levelRaw,
+        'level' => $normalizedLevel,
+    ], 'index.php');
+
+    updateLeadInfoFromOkiDoki($leadId, $normalizedLanguage, $normalizedLevel);
 
     $contactId = getContactIdFromLead($leadId);
 
     if ($contactId !== null) {
-        updateContactInfo($contactId, $fio, $email);
+        updateContactInfo($contactId, $parentFio, $email, $childFio, $childBirthDate);
     }
+
+    try {
+        syncLeadToHollyhop($leadId, true);
+    } catch (Exception $e) {
+        log_error("Ошибка при синхронизации OkiDoki -> Hollyhop", [
+            'lead_id' => $leadId,
+            'error'   => $e->getMessage()
+        ], 'index.php');
+    }
+}
+
+function okiGetExtraField(array $okiData, array $keys): ?string
+{
+    $extraFields = $okiData['extra_fields'] ?? [];
+    if (!is_array($extraFields)) {
+        return null;
+    }
+
+    foreach ($keys as $key) {
+        $value = $extraFields[$key] ?? null;
+        if (is_scalar($value) && trim((string) $value) !== '') {
+            return trim((string) $value);
+        }
+    }
+
+    return null;
+}
+
+function normalizeOkiLevelForAmo(?string $value): ?string
+{
+    if ($value === null || trim($value) === '') {
+        return null;
+    }
+
+    $normalized = mb_strtolower(trim($value), 'UTF-8');
+    $normalized = str_replace(['ё', '‑', '–', '—', '_'], ['е', '-', '-', '-', ' '], $normalized);
+    $normalized = preg_replace('/\s+/u', ' ', $normalized);
+
+    $map = [
+        'a1' => 'A1',
+        'beginner' => 'A1',
+        'a2' => 'A2',
+        'elementary' => 'A2',
+        'b1' => 'B1',
+        'pre-intermediate' => 'B1',
+        'pre intermediate' => 'B1',
+    ];
+
+    return $map[$normalized] ?? trim($value);
+}
+
+function normalizeOkiLanguageForAmo(?string $value): ?string
+{
+    if ($value === null || trim($value) === '') {
+        return null;
+    }
+
+    $normalized = mb_strtolower(trim($value), 'UTF-8');
+    $normalized = str_replace('ё', 'е', $normalized);
+    $normalized = preg_replace('/\s+/u', ' ', $normalized);
+
+    $map = [
+        'английский' => 'Английский',
+        'english' => 'Английский',
+        'китайский' => 'Китайский',
+        'chinese' => 'Китайский',
+        'корейский' => 'Корейский',
+        'korean' => 'Корейский',
+        'японский' => 'Японский',
+        'japanese' => 'Японский',
+        'турецкий' => 'Турецкий',
+        'turkish' => 'Турецкий',
+        'арабский' => 'Арабский',
+        'arabic' => 'Арабский',
+        'испанский' => 'Испанский',
+        'spanish' => 'Испанский',
+        'немецкий' => 'Немецкий',
+        'german' => 'Немецкий',
+        'французский' => 'Французский',
+        'french' => 'Французский',
+        'итальянский' => 'Итальянский',
+        'italian' => 'Итальянский',
+        'хинди' => 'Хинди',
+        'hindi' => 'Хинди',
+        'персидский' => 'Персидский',
+        'persian' => 'Персидский',
+        'иврит' => 'Иврит',
+        'hebrew' => 'Иврит',
+        'рки' => 'РКИ',
+    ];
+
+    return $map[$normalized] ?? trim($value);
+}
+
+function normalizeOkiDateForAmo(?string $value): ?string
+{
+    if ($value === null || trim($value) === '') {
+        return null;
+    }
+
+    $value = trim($value);
+
+    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+        return $value;
+    }
+
+    if (preg_match('/^(\d{2})\.(\d{2})\.(\d{4})$/', $value, $matches)) {
+        return $matches[3] . '-' . $matches[2] . '-' . $matches[1];
+    }
+
+    if (preg_match('/^(\d{2})\/(\d{2})\/(\d{4})$/', $value, $matches)) {
+        return $matches[3] . '-' . $matches[2] . '-' . $matches[1];
+    }
+
+    return $value;
 }
 
 function getContactIdFromLead(int $leadId): ?int
@@ -320,23 +457,98 @@ function getContactIdFromLead(int $leadId): ?int
     }
 }
 
-function updateContactInfo(int $contactId, string $name, string $email): void
+function updateLeadInfoFromOkiDoki(int $leadId, ?string $language, ?string $level): void
 {
     global $subdomain, $data;
 
-    $contactUpdate = [
-        'name' => $name,
-        'custom_fields_values' => [
-            [
-                'field_code' => 'EMAIL',
-                'values'     => [['value' => $email, 'enum_code' => 'WORK']]
-            ]
-        ]
+    $customFields = [];
+
+    if ($language !== null && $language !== '') {
+        $customFields[] = [
+            'field_id' => AMO_FIELD_DISCIPLINE,
+            'values' => [['value' => $language]]
+        ];
+    }
+
+    if ($level !== null && $level !== '') {
+        $customFields[] = [
+            'field_id' => AMO_FIELD_LEVEL,
+            'values' => [['value' => $level]]
+        ];
+    }
+
+    if (empty($customFields)) {
+        return;
+    }
+
+    $leadUpdate = [
+        'id' => $leadId,
+        'custom_fields_values' => $customFields,
     ];
 
     try {
+        post_or_patch($subdomain, $leadUpdate, "/api/v4/leads/$leadId", $data, 'PATCH');
+        log_info("Сделка обновлена данными из OkiDoki", [
+            'lead_id' => $leadId,
+            'language' => $language,
+            'level' => $level,
+        ], 'index.php');
+    } catch (Exception $e) {
+        log_error("Ошибка при обновлении сделки из OkiDoki", [
+            'lead_id' => $leadId,
+            'error' => $e->getMessage()
+        ], 'index.php');
+    }
+}
+
+function updateContactInfo(int $contactId, ?string $name, ?string $email, ?string $childName = null, ?string $childBirthDate = null): void
+{
+    global $subdomain, $data;
+
+    $contactUpdate = ['id' => $contactId];
+    $customFields = [];
+
+    if ($name !== null && $name !== '') {
+        $contactUpdate['name'] = $name;
+    }
+
+    if ($email !== null && $email !== '') {
+        $customFields[] = [
+            'field_code' => 'EMAIL',
+            'values'     => [['value' => $email, 'enum_code' => 'WORK']]
+        ];
+    }
+
+    if ($childName !== null && $childName !== '') {
+        $customFields[] = [
+            'field_id' => AMO_CONTACT_FIELD_CHILD_NAME,
+            'values' => [['value' => $childName]]
+        ];
+    }
+
+    if ($childBirthDate !== null && $childBirthDate !== '') {
+        $customFields[] = [
+            'field_id' => AMO_CONTACT_FIELD_CHILD_BIRTHDATE,
+            'values' => [['value' => $childBirthDate]]
+        ];
+    }
+
+    if (!empty($customFields)) {
+        $contactUpdate['custom_fields_values'] = $customFields;
+    }
+
+    if (count($contactUpdate) === 1) {
+        return;
+    }
+
+    try {
         post_or_patch($subdomain, $contactUpdate, "/api/v4/contacts/$contactId", $data, 'PATCH');
-        log_info("Контакт обновлен", ['contact_id' => $contactId, 'name' => $name], 'index.php');
+        log_info("Контакт обновлен данными из OkiDoki", [
+            'contact_id' => $contactId,
+            'name' => $name,
+            'child_name' => $childName,
+            'child_birth_date' => $childBirthDate,
+        ], 'index.php');
     } catch (Exception $e) {
         log_error("Ошибка при обновлении контакта", [
             'contact_id' => $contactId,
@@ -368,6 +580,11 @@ function extractLeadIdFromWebhook(array $post): ?int
 
 function processAmoCrmLead(int $leadId): void
 {
+    syncLeadToHollyhop($leadId);
+}
+
+function syncLeadToHollyhop(int $leadId, bool $suppressOutput = false): void
+{
     $lead = fetchLeadData($leadId);
 
     if (!hasRequiredLeadData($lead)) {
@@ -387,7 +604,7 @@ function processAmoCrmLead(int $leadId): void
         return;
     }
 
-    $hollyhopResponse = sendStudentToHollyhop($studentData);
+    $hollyhopResponse = sendStudentToHollyhop($studentData, $suppressOutput);
 
     if ($hollyhopResponse !== null) {
         processHollyhopResponse($hollyhopResponse, $leadId, $lead);
@@ -496,14 +713,7 @@ function extractContactData(int $contactId): array
         $contact = get($subdomain, "/api/v4/contacts/{$contactId}", $data);
 
         $contactData = [];
-
-        $nameParts = explode(" ", $contact["name"] ?? "");
-        if (isset($nameParts[0])) {
-            $contactData["firstName"] = $nameParts[0];
-        }
-        if (isset($nameParts[1])) {
-            $contactData["lastName"] = $nameParts[1];
-        }
+        $contactName = trim((string) ($contact["name"] ?? ""));
 
         $customFieldsValues = $contact["custom_fields_values"] ?? [];
         if (is_array($customFieldsValues)) {
@@ -517,6 +727,36 @@ function extractContactData(int $contactId): array
                 if ($fieldId === AMO_CONTACT_FIELD_EMAIL && $value !== null) {
                     $contactData["email"] = $value;
                 }
+                if ($fieldId === AMO_CONTACT_FIELD_CHILD_NAME && $value !== null) {
+                    $contactData["childName"] = $value;
+                }
+                if ($fieldId === AMO_CONTACT_FIELD_CHILD_BIRTHDATE && $value !== null) {
+                    $contactData["childBirthDate"] = $value;
+                }
+            }
+        }
+
+        $studentNameSource = $contactData["childName"] ?? $contactName;
+        $nameParts = preg_split('/\s+/u', trim((string) $studentNameSource)) ?: [];
+
+        if (!empty($nameParts[0])) {
+            $contactData["firstName"] = $nameParts[0];
+        }
+        if (!empty($nameParts[1])) {
+            $contactData["lastName"] = $nameParts[1];
+        }
+        if (!empty($nameParts[2])) {
+            $contactData["middleName"] = implode(' ', array_slice($nameParts, 2));
+        }
+
+        if (!empty($contactData["childBirthDate"])) {
+            $contactData["birthDate"] = $contactData["childBirthDate"];
+        }
+
+        if (!empty($contactData["childName"]) && $contactName !== '') {
+            $contactData["parentName"] = $contactName;
+            if (!empty($contactData["email"])) {
+                $contactData["parentEmail"] = $contactData["email"];
             }
         }
 
@@ -534,14 +774,14 @@ function extractContactData(int $contactId): array
 // ФУНКЦИИ РАБОТЫ С HOLLYHOP
 // ============================================================================
 
-function sendStudentToHollyhop(array $studentData): ?array
+function sendStudentToHollyhop(array $studentData, bool $suppressOutput = false): ?array
 {
     $jsonData = json_encode($studentData, JSON_UNESCAPED_UNICODE);
     log_info("Данные подготовлены для отправки в Hollyhop", $studentData, 'index.php');
 
     // В обычном режиме выводим для отладки, в payment_webhook режиме — нет
     $isPaymentWebhook = isset($_GET['payment_webhook']) && $_GET['payment_webhook'] === '1';
-    if (!$isPaymentWebhook) {
+    if (!$isPaymentWebhook && !$suppressOutput) {
         echo $jsonData . "<br><br>";
     }
 
@@ -578,7 +818,7 @@ function sendStudentToHollyhop(array $studentData): ?array
             'error' => $curlError,
             'url'   => $url
         ], 'index.php');
-        if (!$isPaymentWebhook) {
+        if (!$isPaymentWebhook && !$suppressOutput) {
             echo 'Ошибка cURL: ' . $curlError . "\n";
         }
         curl_close($ch);
@@ -590,7 +830,7 @@ function sendStudentToHollyhop(array $studentData): ?array
         'response'  => $response
     ], 'index.php');
 
-    if (!$isPaymentWebhook) {
+    if (!$isPaymentWebhook && !$suppressOutput) {
         echo "HTTP-код: $httpCode\n";
         echo "Ответ сервера: " . ($response ?: 'пустой ответ') . "\n";
     }
