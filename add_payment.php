@@ -114,8 +114,43 @@ function log_payment_debug($message, $data = null)
     log_payment_message($message, $data, 'DEBUG');
 }
 
-function extract_payer_contact_id_from_catalog_element(array $catalogElement): ?int
+function normalize_phone_for_match(?string $phone): string
 {
+    if ($phone === null) {
+        return '';
+    }
+
+    $digits = preg_replace('/\D+/', '', $phone);
+    if (!is_string($digits) || $digits === '') {
+        return '';
+    }
+
+    if (strlen($digits) === 11 && $digits[0] === '8') {
+        $digits = '7' . substr($digits, 1);
+    }
+
+    if (strlen($digits) >= 10) {
+        return substr($digits, -10);
+    }
+
+    return $digits;
+}
+
+function normalize_email_for_match(?string $email): string
+{
+    $email = is_string($email) ? trim(mb_strtolower($email)) : '';
+    return filter_var($email, FILTER_VALIDATE_EMAIL) ? $email : '';
+}
+
+function extract_payer_data_from_catalog_element(array $catalogElement): array
+{
+    $payerData = [
+        'contact_id' => null,
+        'phones' => [],
+        'emails' => [],
+        'name' => null,
+    ];
+
     foreach ($catalogElement['custom_fields_values'] ?? [] as $field) {
         $fieldCode = $field['field_code'] ?? $field['code'] ?? null;
         if ($fieldCode !== 'PAYER') {
@@ -124,17 +159,35 @@ function extract_payer_contact_id_from_catalog_element(array $catalogElement): ?
 
         foreach ($field['values'] ?? [] as $valueRow) {
             $value = $valueRow['value'] ?? null;
-            if (
-                is_array($value) &&
-                ($value['entity_type'] ?? null) === 'contacts' &&
-                !empty($value['entity_id'])
-            ) {
-                return (int) $value['entity_id'];
+
+            if (!is_array($value)) {
+                continue;
+            }
+
+            if (($value['entity_type'] ?? null) === 'contacts' && !empty($value['entity_id'])) {
+                $payerData['contact_id'] = (int) $value['entity_id'];
+            }
+
+            if (!empty($value['name']) && !$payerData['name']) {
+                $payerData['name'] = trim((string) $value['name']);
+            }
+
+            $normalizedPhone = normalize_phone_for_match($value['phone'] ?? null);
+            if ($normalizedPhone !== '') {
+                $payerData['phones'][$normalizedPhone] = $normalizedPhone;
+            }
+
+            $normalizedEmail = normalize_email_for_match($value['email'] ?? null);
+            if ($normalizedEmail !== '') {
+                $payerData['emails'][$normalizedEmail] = $normalizedEmail;
             }
         }
     }
 
-    return null;
+    $payerData['phones'] = array_values($payerData['phones']);
+    $payerData['emails'] = array_values($payerData['emails']);
+
+    return $payerData;
 }
 
 function fetch_contact_lead_ids(string $subdomain, array $data, int $contactId): array
@@ -152,6 +205,152 @@ function fetch_contact_lead_ids(string $subdomain, array $data, int $contactId):
     }, $leads)));
 }
 
+function extract_contact_channels(array $contact): array
+{
+    $phones = [];
+    $emails = [];
+
+    foreach ($contact['custom_fields_values'] ?? [] as $field) {
+        $fieldCode = $field['field_code'] ?? $field['code'] ?? null;
+        if (!in_array($fieldCode, ['PHONE', 'EMAIL'], true)) {
+            continue;
+        }
+
+        foreach ($field['values'] ?? [] as $valueRow) {
+            $rawValue = $valueRow['value'] ?? null;
+            if (!is_string($rawValue) || trim($rawValue) === '') {
+                continue;
+            }
+
+            if ($fieldCode === 'PHONE') {
+                $normalizedPhone = normalize_phone_for_match($rawValue);
+                if ($normalizedPhone !== '') {
+                    $phones[$normalizedPhone] = $normalizedPhone;
+                }
+            } elseif ($fieldCode === 'EMAIL') {
+                $normalizedEmail = normalize_email_for_match($rawValue);
+                if ($normalizedEmail !== '') {
+                    $emails[$normalizedEmail] = $normalizedEmail;
+                }
+            }
+        }
+    }
+
+    return [
+        'phones' => array_values($phones),
+        'emails' => array_values($emails),
+    ];
+}
+
+function search_contacts_by_queries(string $subdomain, array $data, array $queries): array
+{
+    $foundContacts = [];
+
+    foreach ($queries as $query) {
+        $query = trim((string) $query);
+        if ($query === '') {
+            continue;
+        }
+
+        $response = get(
+            $subdomain,
+            '/api/v4/contacts?with=leads&limit=250&query=' . urlencode($query),
+            $data
+        );
+
+        foreach ($response['_embedded']['contacts'] ?? [] as $contact) {
+            $contactId = (int) ($contact['id'] ?? 0);
+            if ($contactId > 0) {
+                $foundContacts[$contactId] = $contact;
+            }
+        }
+    }
+
+    return array_values($foundContacts);
+}
+
+function find_contacts_by_payer_data(string $subdomain, array $data, array $payerData): array
+{
+    $queries = array_merge($payerData['emails'] ?? [], $payerData['phones'] ?? []);
+    $contacts = search_contacts_by_queries($subdomain, $data, $queries);
+
+    if (empty($contacts)) {
+        return [];
+    }
+
+    $wantedPhones = array_flip($payerData['phones'] ?? []);
+    $wantedEmails = array_flip($payerData['emails'] ?? []);
+    $exactMatches = [];
+
+    foreach ($contacts as $contact) {
+        $channels = extract_contact_channels($contact);
+        $matchedPhone = false;
+        foreach ($channels['phones'] as $phone) {
+            if (isset($wantedPhones[$phone])) {
+                $matchedPhone = true;
+                break;
+            }
+        }
+
+        $matchedEmail = false;
+        foreach ($channels['emails'] as $email) {
+            if (isset($wantedEmails[$email])) {
+                $matchedEmail = true;
+                break;
+            }
+        }
+
+        if ($matchedPhone || $matchedEmail) {
+            $exactMatches[] = $contact;
+        }
+    }
+
+    if (!empty($exactMatches)) {
+        return $exactMatches;
+    }
+
+    if (count($contacts) === 1) {
+        return $contacts;
+    }
+
+    return [];
+}
+
+function find_lead_by_catalog_element_links(
+    string $subdomain,
+    array $data,
+    int $catalog_element_id,
+    ?int $catalog_id = null
+): ?array {
+    if (!$catalog_id) {
+        return null;
+    }
+
+    $response = get(
+        $subdomain,
+        '/api/v4/catalogs/' . $catalog_id . '/elements/' . $catalog_element_id . '/links',
+        $data
+    );
+
+    $links = $response['_embedded']['links'] ?? [];
+    if (!is_array($links) || empty($links)) {
+        return null;
+    }
+
+    foreach ($links as $link) {
+        $leadId = (int) ($link['to_entity_id'] ?? 0);
+        if (($link['to_entity_type'] ?? null) === 'leads' && $leadId > 0) {
+            return [
+                'lead_id' => $leadId,
+                'checked_leads' => 1,
+                'strategy' => 'catalog_element_links',
+            ];
+        }
+    }
+
+    return null;
+}
+
 function find_lead_by_catalog_link(
     string $subdomain,
     array $data,
@@ -161,6 +360,17 @@ function find_lead_by_catalog_link(
 ): ?array {
     $started_at = microtime(true);
 
+    $directLinkResult = find_lead_by_catalog_element_links($subdomain, $data, $catalog_element_id, $catalog_id);
+    if ($directLinkResult) {
+        log_payment_info("✓ Сделка найдена через links элемента счета", [
+            'lead_id' => $directLinkResult['lead_id'],
+            'catalog_element_id' => $catalog_element_id,
+            'catalog_id' => $catalog_id,
+            'elapsed_seconds' => round(microtime(true) - $started_at, 2),
+        ]);
+        return $directLinkResult;
+    }
+
     if ($catalogElement === null) {
         if (!$catalog_id) {
             return null;
@@ -169,28 +379,62 @@ function find_lead_by_catalog_link(
         $catalogElement = get($subdomain, '/api/v4/catalogs/' . $catalog_id . '/elements/' . $catalog_element_id, $data);
     }
 
-    $payerContactId = extract_payer_contact_id_from_catalog_element($catalogElement);
+    $payerData = extract_payer_data_from_catalog_element($catalogElement);
+    $payerContactId = $payerData['contact_id'];
 
     log_payment_info("Поиск сделки по счету через плательщика счета", [
         'catalog_element_id' => $catalog_element_id,
         'catalog_id' => $catalog_id,
         'payer_contact_id' => $payerContactId,
+        'payer_phones' => $payerData['phones'],
+        'payer_emails' => $payerData['emails'],
     ]);
 
-    if (!$payerContactId) {
-        log_payment_warning("У счета не найден contact_id плательщика", [
+    $candidateLeadIds = [];
+    $matchedContactIds = [];
+
+    if ($payerContactId) {
+        $matchedContactIds[] = $payerContactId;
+        $candidateLeadIds = fetch_contact_lead_ids($subdomain, $data, $payerContactId);
+    } elseif (!empty($payerData['phones']) || !empty($payerData['emails'])) {
+        $matchedContacts = find_contacts_by_payer_data($subdomain, $data, $payerData);
+
+        foreach ($matchedContacts as $contact) {
+            $contactId = (int) ($contact['id'] ?? 0);
+            if ($contactId <= 0) {
+                continue;
+            }
+
+            $matchedContactIds[] = $contactId;
+            foreach (($contact['_embedded']['leads'] ?? []) as $lead) {
+                $leadId = (int) ($lead['id'] ?? 0);
+                if ($leadId > 0) {
+                    $candidateLeadIds[$leadId] = $leadId;
+                }
+            }
+        }
+
+        log_payment_info("Результат поиска контакта плательщика по данным счета", [
+            'catalog_element_id' => $catalog_element_id,
+            'catalog_id' => $catalog_id,
+            'matched_contact_ids' => $matchedContactIds,
+            'matched_contacts_count' => count($matchedContactIds),
+        ]);
+    } else {
+        log_payment_warning("У счета не найден ни contact_id, ни контакты плательщика", [
             'catalog_element_id' => $catalog_element_id,
             'catalog_id' => $catalog_id,
         ]);
         return null;
     }
 
-    $candidateLeadIds = fetch_contact_lead_ids($subdomain, $data, $payerContactId);
+    $candidateLeadIds = array_values(array_unique(array_map('intval', (array) $candidateLeadIds)));
 
     log_payment_info("Получены сделки контакта-плательщика", [
         'catalog_element_id' => $catalog_element_id,
         'catalog_id' => $catalog_id,
         'payer_contact_id' => $payerContactId,
+        'matched_contact_ids' => $matchedContactIds,
         'candidate_leads_count' => count($candidateLeadIds),
         'candidate_lead_ids' => $candidateLeadIds,
     ]);
@@ -239,6 +483,7 @@ function find_lead_by_catalog_link(
                     'catalog_element_id' => $catalog_element_id,
                     'catalog_id' => $catalog_id,
                     'payer_contact_id' => $payerContactId,
+                    'matched_contact_ids' => $matchedContactIds,
                     'checked_leads' => $checkedLeads,
                     'elapsed_seconds' => round(microtime(true) - $started_at, 2),
                 ]);
@@ -246,7 +491,7 @@ function find_lead_by_catalog_link(
                 return [
                     'lead_id' => $leadIdFromLink,
                     'checked_leads' => $checkedLeads,
-                    'strategy' => 'payer_contact_links',
+                    'strategy' => $payerContactId ? 'payer_contact_links' : 'payer_query_links',
                 ];
             }
         }
@@ -256,6 +501,7 @@ function find_lead_by_catalog_link(
         'catalog_element_id' => $catalog_element_id,
         'catalog_id' => $catalog_id,
         'payer_contact_id' => $payerContactId,
+        'matched_contact_ids' => $matchedContactIds,
         'candidate_leads_count' => count($candidateLeadIds),
         'elapsed_seconds' => round(microtime(true) - $started_at, 2),
     ]);
