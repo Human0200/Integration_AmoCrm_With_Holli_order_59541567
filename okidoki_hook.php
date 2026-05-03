@@ -25,9 +25,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
 
 $rawInput = file_get_contents('php://input');
 $payload = json_decode($rawInput, true);
+$payloadHash = hash('sha256', (string) $rawInput);
 
 if (!is_array($payload)) {
     okidoki_log_warning('OkiDoki: не удалось декодировать JSON', [
+        'payload_hash' => $payloadHash,
         'raw_input_preview' => mb_substr((string) $rawInput, 0, 1000, 'UTF-8')
     ]);
 
@@ -39,15 +41,21 @@ if (!is_array($payload)) {
     exit;
 }
 
+okidoki_log_info('OkiDoki: callback получен', buildOkiPayloadDebugContext($payload, $payloadHash));
+
+$statusInfo = getOkiStatusInfo($payload);
+
 if (!isOkiDokiSignedContract($payload)) {
     okidoki_log_info('OkiDoki: вебхук пропущен, статус не signed', [
-        'status' => $payload['status'] ?? null
+        'payload_hash' => $payloadHash,
+        'status' => $statusInfo
     ]);
 
     echo json_encode([
         'success' => true,
         'ignored' => true,
-        'reason' => 'status is not signed'
+        'reason' => 'status is not signed',
+        'status' => $statusInfo['normalized'] ?? null
     ], JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -55,20 +63,27 @@ if (!isOkiDokiSignedContract($payload)) {
 try {
     $studentPayload = buildStudentPayloadFromOkiDoki($payload);
 
-    okidoki_log_info('OkiDoki: подготовлены данные для add_student.php', $studentPayload);
+    okidoki_log_info('OkiDoki: подготовлены данные для add_student.php', [
+        'payload_hash' => $payloadHash,
+        'student_payload' => maskSensitiveData($studentPayload)
+    ]);
 
     $addStudentResponse = sendPayloadToAddStudent($studentPayload);
 
-    okidoki_log_info('OkiDoki: ответ от add_student.php получен', $addStudentResponse);
+    okidoki_log_info('OkiDoki: ответ от add_student.php получен', [
+        'payload_hash' => $payloadHash,
+        'response' => maskSensitiveData($addStudentResponse)
+    ]);
 
     echo json_encode([
         'success' => true,
         'source' => 'okidoki',
-        'student_payload' => $studentPayload,
+        'status' => $statusInfo['normalized'] ?? null,
         'hollyhop_response' => $addStudentResponse
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 } catch (Throwable $e) {
     okidoki_log_error('OkiDoki: ошибка обработки webhook', [
+        'payload_hash' => $payloadHash,
         'error' => $e->getMessage(),
         'trace' => $e->getTraceAsString()
     ]);
@@ -82,7 +97,7 @@ try {
 
 function isOkiDokiSignedContract(array $data): bool
 {
-    return isset($data['status']) && $data['status'] === 'signed';
+    return getOkiStatusInfo($data)['is_signed'];
 }
 
 function okidoki_log(string $level, string $message, $data = null): void
@@ -127,7 +142,13 @@ function okidoki_log_error(string $message, $data = null): void
 function buildStudentPayloadFromOkiDoki(array $payload): array
 {
     $parentName = trim((string) getOkiField($payload, ['ФИО клиента']));
+    if ($parentName === '') {
+        $parentName = buildOkiClientFullName($payload);
+    }
+
     $email = trim((string) getOkiField($payload, ['E-Mail клиента', 'Email клиента']));
+    $phone = normalizeOkiPhone((string) getOkiField($payload, ['Телефон', 'Телефон клиента', 'Телефон заказчика', 'Мобильный телефон']));
+    $emergencyPhone = normalizeOkiPhone((string) getOkiField($payload, ['Телефон (экстренный)', 'Экстренный телефон', 'Дополнительный телефон']));
     $childName = trim((string) getOkiField($payload, ['ФИО ребенка', 'ФИО ребёнка']));
     $childBirthDate = normalizeOkiDate((string) getOkiField($payload, ['Дата рождения ребенка', 'Дата рождения ребёнка']));
     $language = normalizeOkiLanguage((string) getOkiField($payload, ['Язык', 'Иностранный язык', 'Язык ребенка', 'Язык ребёнка']));
@@ -149,6 +170,12 @@ function buildStudentPayloadFromOkiDoki(array $payload): array
         $studentPayload['email'] = $email;
         $studentPayload['parentEmail'] = $email;
     }
+    if ($phone !== '') {
+        $studentPayload['parentPhone'] = $phone;
+    }
+    if ($emergencyPhone !== '') {
+        $studentPayload['parentEmergencyPhone'] = $emergencyPhone;
+    }
     if ($parentName !== '') {
         $studentPayload['parentName'] = $parentName;
     }
@@ -158,6 +185,7 @@ function buildStudentPayloadFromOkiDoki(array $payload): array
     if ($childBirthDate !== '') {
         $studentPayload['birthDate'] = $childBirthDate;
         $studentPayload['childBirthDate'] = $childBirthDate;
+        $studentPayload['Дата рождения'] = $childBirthDate;
     }
     if ($language !== '') {
         $studentPayload['discipline'] = $language;
@@ -165,6 +193,7 @@ function buildStudentPayloadFromOkiDoki(array $payload): array
     if ($level !== '') {
         $studentPayload['level'] = $level;
     }
+    $studentPayload['sourceSystem'] = 'okidoki';
     if (!empty($payload['lead_id'])) {
         $studentPayload['amo_lead_id'] = (int) $payload['lead_id'];
     }
@@ -236,19 +265,257 @@ function buildLocalEndpointUrl(string $scriptName): string
 
 function getOkiField(array $payload, array $keys): ?string
 {
+    $sources = [];
+
     $extraFields = $payload['extra_fields'] ?? [];
-    if (!is_array($extraFields)) {
-        return null;
+    if (is_array($extraFields)) {
+        $sources[] = $extraFields;
     }
 
-    foreach ($keys as $key) {
-        $value = $extraFields[$key] ?? null;
-        if (is_scalar($value) && trim((string) $value) !== '') {
-            return trim((string) $value);
+    $entitiesMap = buildOkiKeywordMap($payload['entities'] ?? null);
+    if (!empty($entitiesMap)) {
+        $sources[] = $entitiesMap;
+    }
+
+    $systemEntitiesMap = buildOkiKeywordMap($payload['system_entities'] ?? null);
+    if (!empty($systemEntitiesMap)) {
+        $sources[] = $systemEntitiesMap;
+    }
+
+    foreach ($sources as $source) {
+        $normalizedSource = buildNormalizedOkiFieldMap($source);
+
+        foreach ($keys as $key) {
+            $value = $source[$key] ?? null;
+            if (is_scalar($value) && trim((string) $value) !== '') {
+                return trim((string) $value);
+            }
+
+            $normalizedValue = $normalizedSource[normalizeOkiLookupKey($key)] ?? null;
+            if (is_string($normalizedValue) && trim($normalizedValue) !== '') {
+                return trim($normalizedValue);
+            }
         }
     }
 
     return null;
+}
+
+function buildNormalizedOkiFieldMap(array $source): array
+{
+    $normalized = [];
+
+    foreach ($source as $key => $value) {
+        if (!is_scalar($value)) {
+            continue;
+        }
+
+        $normalized[normalizeOkiLookupKey((string) $key)] = trim((string) $value);
+    }
+
+    return $normalized;
+}
+
+function normalizeOkiLookupKey(string $value): string
+{
+    $value = trim($value);
+    $value = mb_strtolower($value, 'UTF-8');
+    $value = str_replace('ё', 'е', $value);
+    $value = preg_replace('/\s+/u', ' ', $value);
+
+    return trim((string) $value);
+}
+
+function buildOkiKeywordMap($items): array
+{
+    if (!is_array($items)) {
+        return [];
+    }
+
+    $map = [];
+
+    foreach ($items as $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+
+        $keyword = isset($item['keyword']) && is_scalar($item['keyword'])
+            ? trim((string) $item['keyword'])
+            : '';
+
+        if ($keyword === '') {
+            continue;
+        }
+
+        $value = $item['value'] ?? null;
+        if (!is_scalar($value)) {
+            continue;
+        }
+
+        $map[$keyword] = trim((string) $value);
+    }
+
+    return $map;
+}
+
+function buildOkiClientFullName(array $payload): string
+{
+    $parts = [
+        trim((string) getOkiField($payload, ['Фамилия клиента'])),
+        trim((string) getOkiField($payload, ['Имя клиента'])),
+        trim((string) getOkiField($payload, ['Отчество клиента']))
+    ];
+
+    $parts = array_values(array_filter($parts, static function ($part) {
+        return $part !== '';
+    }));
+
+    return implode(' ', $parts);
+}
+
+function getOkiStatusInfo(array $payload): array
+{
+    $status = $payload['status'] ?? null;
+    $rawValue = null;
+    $name = null;
+    $internalId = null;
+
+    if (is_string($status)) {
+        $rawValue = trim($status);
+        $name = $rawValue;
+    } elseif (is_array($status)) {
+        if (isset($status['name']) && is_scalar($status['name'])) {
+            $name = trim((string) $status['name']);
+        }
+        if (isset($status['internal_id']) && is_scalar($status['internal_id'])) {
+            $internalId = (string) $status['internal_id'];
+        }
+        $rawValue = $name;
+    }
+
+    $normalized = mb_strtolower((string) $rawValue, 'UTF-8');
+    $normalized = str_replace(['ё', '_', '-'], ['е', ' ', ' '], $normalized);
+    $normalized = preg_replace('/\s+/u', ' ', $normalized);
+    $normalized = trim((string) $normalized);
+
+    $signedStatuses = [
+        'signed',
+        'подписан',
+        'подписано',
+        'подписан клиентом',
+        'договор подписан'
+    ];
+
+    return [
+        'raw' => $status,
+        'name' => $name,
+        'internal_id' => $internalId,
+        'normalized' => $normalized,
+        'is_signed' => in_array($normalized, $signedStatuses, true)
+    ];
+}
+
+function buildOkiPayloadDebugContext(array $payload, string $payloadHash): array
+{
+    $extraFields = $payload['extra_fields'] ?? [];
+    $extraFieldKeys = is_array($extraFields) ? array_keys($extraFields) : [];
+
+    return [
+        'payload_hash' => $payloadHash,
+        'top_level_keys' => array_keys($payload),
+        'status' => getOkiStatusInfo($payload),
+        'lead_id' => $payload['lead_id'] ?? null,
+        'extra_fields_count' => count($extraFieldKeys),
+        'extra_fields_keys' => $extraFieldKeys,
+        'payload_masked' => maskSensitiveData($payload)
+    ];
+}
+
+function maskSensitiveData($value)
+{
+    if (is_array($value)) {
+        $masked = [];
+        foreach ($value as $key => $item) {
+            $masked[$key] = maskSensitiveValueByKey((string) $key, $item);
+        }
+
+        return $masked;
+    }
+
+    return $value;
+}
+
+function maskSensitiveValueByKey(string $key, $value)
+{
+    if (is_array($value)) {
+        return maskSensitiveData($value);
+    }
+
+    if (!is_scalar($value) && $value !== null) {
+        return $value;
+    }
+
+    $stringValue = trim((string) $value);
+    if ($stringValue === '') {
+        return $value;
+    }
+
+    $normalizedKey = mb_strtolower($key, 'UTF-8');
+    $normalizedKey = str_replace('ё', 'е', $normalizedKey);
+
+    if (strpos($normalizedKey, 'mail') !== false || strpos($normalizedKey, 'email') !== false) {
+        return maskEmail($stringValue);
+    }
+
+    if (strpos($normalizedKey, 'телефон') !== false || strpos($normalizedKey, 'phone') !== false || strpos($normalizedKey, 'mobile') !== false) {
+        return maskPhone($stringValue);
+    }
+
+    if (strpos($normalizedKey, 'фио') !== false || strpos($normalizedKey, 'name') !== false) {
+        return maskHumanName($stringValue);
+    }
+
+    return $value;
+}
+
+function maskEmail(string $value): string
+{
+    $parts = explode('@', $value, 2);
+    if (count($parts) !== 2) {
+        return '***';
+    }
+
+    $localPart = $parts[0];
+    $domain = $parts[1];
+    $visibleLocal = mb_substr($localPart, 0, 2, 'UTF-8');
+
+    return $visibleLocal . '***@' . $domain;
+}
+
+function maskPhone(string $value): string
+{
+    $digits = preg_replace('/\D+/', '', $value);
+    if ($digits === '') {
+        return '***';
+    }
+
+    $prefix = substr($digits, 0, min(2, strlen($digits)));
+    $suffix = substr($digits, -2);
+
+    return $prefix . str_repeat('*', max(0, strlen($digits) - strlen($prefix) - strlen($suffix))) . $suffix;
+}
+
+function maskHumanName(string $value): string
+{
+    $parts = preg_split('/\s+/u', trim($value)) ?: [];
+    $maskedParts = [];
+
+    foreach ($parts as $part) {
+        $firstChar = mb_substr($part, 0, 1, 'UTF-8');
+        $maskedParts[] = $firstChar . '***';
+    }
+
+    return implode(' ', $maskedParts);
 }
 
 function splitFullName(string $fullName): array
@@ -277,6 +544,15 @@ function normalizeOkiLevel(string $value): string
     $normalized = mb_strtolower($value, 'UTF-8');
     $normalized = str_replace(['ё', '‑', '–', '—', '_'], ['е', '-', '-', '-', ' '], $normalized);
     $normalized = preg_replace('/\s+/u', ' ', $normalized);
+    $normalized = str_replace(
+        ['а', 'в', 'с'],
+        ['a', 'b', 'c'],
+        $normalized
+    );
+
+    if (preg_match('/\b([abc][0-2])\b/u', $normalized, $matches)) {
+        return strtoupper($matches[1]);
+    }
 
     $map = [
         'a1' => 'A1',
@@ -298,38 +574,37 @@ function normalizeOkiLanguage(string $value): string
         return '';
     }
 
-    $normalized = mb_strtolower($value, 'UTF-8');
-    $normalized = str_replace('ё', 'е', $normalized);
-    $normalized = preg_replace('/\s+/u', ' ', $normalized);
+    $normalized = normalizeOkiLookupKey($value);
 
     $map = [
+        'японский' => 'Японский',
+        'корейский' => 'Корейский',
+        'арабский' => 'Арабский',
+        'турецкий' => 'Турецкий',
+        'испанский' => 'Испанский',
+        'итальянский' => 'Итальянский',
+        'персидский' => 'Персидский',
         'английский' => 'Английский',
         'english' => 'Английский',
+        'хинди' => 'Хинди',
+        'иврит' => 'Иврит',
+        'рки' => 'РКИ',
+        'французский' => 'Французский',
+        'немецкий' => 'Немецкий',
         'китайский' => 'Китайский',
         'chinese' => 'Китайский',
-        'корейский' => 'Корейский',
         'korean' => 'Корейский',
-        'японский' => 'Японский',
         'japanese' => 'Японский',
-        'турецкий' => 'Турецкий',
         'turkish' => 'Турецкий',
-        'арабский' => 'Арабский',
         'arabic' => 'Арабский',
-        'испанский' => 'Испанский',
         'spanish' => 'Испанский',
-        'немецкий' => 'Немецкий',
         'german' => 'Немецкий',
-        'французский' => 'Французский',
         'french' => 'Французский',
-        'итальянский' => 'Итальянский',
         'italian' => 'Итальянский',
-        'хинди' => 'Хинди',
         'hindi' => 'Хинди',
-        'персидский' => 'Персидский',
         'persian' => 'Персидский',
-        'иврит' => 'Иврит',
         'hebrew' => 'Иврит',
-        'рки' => 'РКИ',
+        'rki' => 'РКИ',
     ];
 
     return $map[$normalized] ?? $value;
@@ -354,5 +629,49 @@ function normalizeOkiDate(string $value): string
         return $matches[3] . '-' . $matches[2] . '-' . $matches[1];
     }
 
+    $monthMap = [
+        'января' => '01',
+        'февраля' => '02',
+        'марта' => '03',
+        'апреля' => '04',
+        'мая' => '05',
+        'июня' => '06',
+        'июля' => '07',
+        'августа' => '08',
+        'сентября' => '09',
+        'октября' => '10',
+        'ноября' => '11',
+        'декабря' => '12',
+    ];
+
+    if (preg_match('/^(\d{1,2})\s+([[:alpha:]]+)\s+(\d{4})(?:\s*г\.?)?$/u', mb_strtolower($value, 'UTF-8'), $matches)) {
+        $day = str_pad($matches[1], 2, '0', STR_PAD_LEFT);
+        $monthName = $matches[2];
+        $year = $matches[3];
+
+        if (isset($monthMap[$monthName])) {
+            return $year . '-' . $monthMap[$monthName] . '-' . $day;
+        }
+    }
+
     return $value;
+}
+
+function normalizeOkiPhone(string $value): string
+{
+    $value = trim($value);
+    if ($value === '') {
+        return '';
+    }
+
+    $digits = preg_replace('/\D+/', '', $value);
+    if ($digits === '') {
+        return '';
+    }
+
+    if (strlen($digits) === 11 && $digits[0] === '8') {
+        $digits = '7' . substr($digits, 1);
+    }
+
+    return $digits;
 }
