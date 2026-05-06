@@ -48,7 +48,7 @@ try
 {
 	/** Если код ответа не успешный - возвращаем сообщение об ошибке  */
 	if ($code < 200 || $code > 204) {
-		throw new Exception(isset($errors[$code]) ? $errors[$code] : 'Undefined error', $code);
+		die('Ошибка: ' . (isset($errors[$code]) ? $errors[$code] : 'Undefined error') . PHP_EOL . 'Код ошибки: ' . $code . PHP_EOL . 'Ответ: ' . $out);
 	}
 }
 catch(\Exception $e)
