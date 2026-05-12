@@ -491,42 +491,42 @@ function resolveCoordinatorRouting(string $responsible): array
         'алина' => [
             'label' => 'Алина',
             'amo_field_value' => AMO_COORD_ALINA_VALUE,
-            'responsible_user_id' => 0,
+            'responsible_user_id' => AMO_COORD_ALINA_USER_ID,
             'pipeline_id' => AMO_COORD_ALINA_PIPELINE_ID,
             'status_id' => AMO_COORD_ALINA_STATUS_ID
         ],
         'координатор алина' => [
             'label' => 'Алина',
             'amo_field_value' => AMO_COORD_ALINA_VALUE,
-            'responsible_user_id' => 0,
+            'responsible_user_id' => AMO_COORD_ALINA_USER_ID,
             'pipeline_id' => AMO_COORD_ALINA_PIPELINE_ID,
             'status_id' => AMO_COORD_ALINA_STATUS_ID
         ],
         'ирина' => [
             'label' => 'Ирина',
             'amo_field_value' => AMO_COORD_IRINA_VALUE,
-            'responsible_user_id' => 0,
+            'responsible_user_id' => AMO_COORD_IRINA_USER_ID,
             'pipeline_id' => AMO_COORD_IRINA_PIPELINE_ID,
             'status_id' => AMO_COORD_IRINA_STATUS_ID
         ],
         'координатор ирина' => [
             'label' => 'Ирина',
             'amo_field_value' => AMO_COORD_IRINA_VALUE,
-            'responsible_user_id' => 0,
+            'responsible_user_id' => AMO_COORD_IRINA_USER_ID,
             'pipeline_id' => AMO_COORD_IRINA_PIPELINE_ID,
             'status_id' => AMO_COORD_IRINA_STATUS_ID
         ],
         'шабо' => [
             'label' => 'Шабо',
             'amo_field_value' => AMO_COORD_SHABO_VALUE,
-            'responsible_user_id' => 0,
+            'responsible_user_id' => AMO_COORD_SHABO_USER_ID,
             'pipeline_id' => AMO_COORD_SHABO_PIPELINE_ID,
             'status_id' => AMO_COORD_SHABO_STATUS_ID
         ],
         'координатор шабо' => [
             'label' => 'Шабо',
             'amo_field_value' => AMO_COORD_SHABO_VALUE,
-            'responsible_user_id' => 0,
+            'responsible_user_id' => AMO_COORD_SHABO_USER_ID,
             'pipeline_id' => AMO_COORD_SHABO_PIPELINE_ID,
             'status_id' => AMO_COORD_SHABO_STATUS_ID
         ]
