@@ -1255,16 +1255,21 @@ try {
         }
 
         if ($office_id === null) {
-            throw new Exception("Не удалось получить officeOrCompanyId для студента с clientId = {$client_id}");
+            log_payment_warning("Не удалось получить officeOrCompanyId для студента с clientId = {$client_id}. Используем филиал по умолчанию (36).", [
+                'clientId' => $client_id
+            ]);
+            $office_id = 36; // Филиал по умолчанию
         }
     } catch (Exception $e) {
-        log_payment_error("✗ Ошибка при получении officeOrCompanyId", [
-            'clientId' => $client_id,
-            'error'    => $e->getMessage()
-        ]);
-        http_response_code(404);
-        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
-        exit;
+        if (!isset($office_id) || $office_id === null) {
+            log_payment_error("✗ Ошибка при получении officeOrCompanyId", [
+                'clientId' => $client_id,
+                'error'    => $e->getMessage()
+            ]);
+            http_response_code(404);
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+            exit;
+        }
     }
 
     // Восстанавливаем ссылку на профиль в сделке если её нет
