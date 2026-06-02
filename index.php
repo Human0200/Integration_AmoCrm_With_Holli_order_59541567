@@ -288,7 +288,7 @@ function handleOkiDokiSignedContract(array $okiData): void
 {
     global $subdomain, $data;
 
-    $leadId = (int) ($okiData['lead_id'] ?? 0);
+    $leadId = (int) ($okiData['lead_id'] ?? $okiData['external_id'] ?? 0);
     $parentFio = trim((string) okiGetExtraField($okiData, ['ФИО клиента']));
     $email = trim((string) okiGetExtraField($okiData, ['E-Mail клиента', 'Email клиента']));
     $childFio = trim((string) okiGetExtraField($okiData, ['ФИО ребенка', 'ФИО ребёнка']));
@@ -698,6 +698,11 @@ function extractLeadCustomFields(array $customFieldsValues): array
                 break;
             case AMO_FIELD_RESPONSIBLE_USER:
                 $fields["responsible_user"] = $value;
+                break;
+            case AMO_FIELD_PROFILE_LINK:
+                if (preg_match('/\/Profile\/(\d+)/', (string) $value, $m)) {
+                    $fields["existing_profile_id"] = (int) $m[1];
+                }
                 break;
         }
     }

@@ -751,6 +751,37 @@ if (!empty($post_data['officeOrCompanyId'])) {
     $existing_student = null;
     $is_update = false;
 
+    // Если в AMO-сделке уже есть ссылка на профиль Холи — используем этот профиль напрямую.
+    // Это защита от дублей: когда AMO присылает два вебхука для одной сделки почти одновременно,
+    // второй запрос найдёт уже записанный профиль и не создаст нового студента.
+    $existing_profile_id = isset($post_data['existing_profile_id']) ? (int)$post_data['existing_profile_id'] : 0;
+    if ($existing_profile_id > 0) {
+        log_message("Найден existing_profile_id в данных — ищем студента по Id", [
+            'existing_profile_id' => $existing_profile_id
+        ], 'INFO');
+        try {
+            $profile_response = call_hollyhop_api('GetStudents', ['Id' => $existing_profile_id], $auth_key, $api_base_url);
+            $profile_students = $profile_response['Students'] ?? (isset($profile_response['Id']) ? [$profile_response] : []);
+            foreach ((array)$profile_students as $s) {
+                $sid = $s['Id'] ?? $s['id'] ?? null;
+                if ((int)$sid === $existing_profile_id) {
+                    $existing_student = $s;
+                    $is_update = true;
+                    log_message("✓ Студент найден по existing_profile_id, пропускаем создание", [
+                        'Id' => $existing_profile_id,
+                        'ClientId' => $s['ClientId'] ?? $s['clientId'] ?? null
+                    ], 'INFO');
+                    break;
+                }
+            }
+        } catch (Exception $e) {
+            log_message("Не удалось найти студента по existing_profile_id, продолжаем поиск по телефону", [
+                'existing_profile_id' => $existing_profile_id,
+                'error' => $e->getMessage()
+            ], 'WARNING');
+        }
+    }
+
     $search_phones = [];
     $candidate_search_phones = [
         $post_data['phone'] ?? '',
@@ -764,7 +795,7 @@ if (!empty($post_data['officeOrCompanyId'])) {
         }
     }
 
-    if (!empty($search_phones)) {
+    if (!empty($search_phones) && $existing_student === null) {
         try {
             log_message("Поиск существующего студента по телефонам", [
                 'phones' => $search_phones
