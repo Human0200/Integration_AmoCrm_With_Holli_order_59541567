@@ -746,6 +746,37 @@ if (!empty($post_data['officeOrCompanyId'])) {
         'has_officeOrCompanyId' => isset($student_params['officeOrCompanyId'])
     ], 'INFO');
 
+    // Мьютекс по телефону/lead_id: предотвращает дубли при параллельных вебхуках.
+    // Второй процесс ждёт здесь, пока первый не создаст студента и не снимет блокировку.
+    // После захвата блокировки поиск повторяется — чтобы найти студента, созданного первым процессом.
+    $_lock_key = '';
+    if (!empty($post_data['phone'])) {
+        $_lp = preg_replace('/\D/', '', (string)$post_data['phone']);
+        if (strlen($_lp) === 11 && substr($_lp, 0, 1) === '8') {
+            $_lp = '7' . substr($_lp, 1);
+        }
+        $_lock_key = $_lp;
+    } elseif (!empty($post_data['amo_lead_id'])) {
+        $_lock_key = 'lead_' . (int)$post_data['amo_lead_id'];
+    }
+    $_lock_fp = null;
+    if ($_lock_key !== '') {
+        $_lock_dir = __DIR__ . '/locks';
+        if (!is_dir($_lock_dir)) {
+            mkdir($_lock_dir, 0755, true);
+        }
+        $_lock_file = $_lock_dir . '/student_' . md5($_lock_key) . '.lock';
+        log_message("Попытка открыть lock-файл", ['lock_file' => $_lock_file, 'lock_key' => $_lock_key], 'INFO');
+        $_lock_fp = fopen($_lock_file, 'w');
+        if ($_lock_fp) {
+            log_message("Ожидание мьютекса (anti-duplicate lock)", ['lock_key' => $_lock_key], 'INFO');
+            flock($_lock_fp, LOCK_EX);
+            log_message("Мьютекс захвачен", ['lock_key' => $_lock_key], 'INFO');
+        } else {
+            log_message("Не удалось открыть lock-файл, продолжаем без блокировки", ['lock_file' => $_lock_file], 'WARNING');
+        }
+    }
+
     // Проверяем, существует ли уже студент с таким же именем и телефоном
     log_message("ШАГ 4: Поиск существующего студента по телефону", [], 'INFO');
     $existing_student = null;
@@ -1023,6 +1054,13 @@ if (!empty($post_data['officeOrCompanyId'])) {
             'existing_id' => $existing_student['Id'] ?? $existing_student['id'] ?? 'не найден',
             'existing_clientId' => $existing_student['ClientId'] ?? $existing_student['clientId'] ?? 'не найден'
         ], 'INFO');
+    }
+
+    // Снимаем мьютекс — студент создан (или найден), следующий параллельный процесс может продолжать
+    if ($_lock_fp) {
+        flock($_lock_fp, LOCK_UN);
+        fclose($_lock_fp);
+        log_message("Мьютекс освобождён", ['lock_key' => $_lock_key], 'INFO');
     }
 
     // Инициализируем переменные для ID студента

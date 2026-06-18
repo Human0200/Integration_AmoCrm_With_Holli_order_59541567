@@ -5,6 +5,17 @@ require_once('./amo_func.php');
 $subdomain = 'directorchinatutorru';
 $target_field_id = 1598377; // ID поля "Канал"
 $log_file = __DIR__ . '/logs/salebot_debug.txt';
+
+// Маппинг Salebot-переменных → field_id в AmoCRM
+// Каждая переменная пишется сразу в несколько полей (старые UTM + ДКТ)
+$utm_field_map = [
+    'utm_source'   => [1138341, 1623791], // utm_source   + ДКТ: Источник
+    'utm_medium'   => [1138337, 1623793], // utm_medium   + ДКТ: Канал
+    'utm_campaign' => [1138339, 1623795], // utm_campaign + ДКТ: Кампания
+    'utm_content'  => [1138335, 1623797], // utm_content  + ДКТ: Содержимое
+    'utm_term'     => [1138343, 1623799], // utm_term     + ДКТ: Что искал
+    'viewed_page'  => [1623809],          // ДКТ: Страница звонка
+];
 // --------------------
 
 // Правильный маппинг значений
@@ -61,12 +72,22 @@ $client_type = $salebot_data['client']['client_type'] ?? null;
 // Также проверяем поле messenger если есть
 $messenger = $salebot_data['client']['variables']['messenger'] ?? null;
 
+// Извлекаем UTM-метки и viewed_page из переменных Salebot
+$utm_values = [];
+foreach (array_keys($utm_field_map) as $utm_key) {
+    $val = $salebot_data['client']['variables'][$utm_key] ?? null;
+    if (!empty($val)) {
+        $utm_values[$utm_key] = $val;
+    }
+}
+
 write_log('ИЗВЛЕЧЕННЫЕ ДАННЫЕ', [
     'amo_unsorted_id' => $amo_unsorted_id,
     'amo_client_id' => $amo_client_id,
     'amo_lead_id' => $amo_lead_id,
     'client_type' => $client_type,
-    'messenger' => $messenger
+    'messenger' => $messenger,
+    'utm_values' => $utm_values,
 ]);
 
 if (!$amo_unsorted_id && !$amo_client_id && !$amo_lead_id) {
@@ -178,12 +199,12 @@ write_log('ОПРЕДЕЛЕН КАНАЛ', [
     'found_by' => $found_by
 ]);
 
-// --- 5. Получаем текущее значение ---
+// --- 5. Получаем текущее значение канала ---
 $current_enum_id = null;
 
 try {
     $lead_info = get($subdomain, "/api/v4/leads/{$lead_id}", $GLOBALS['data']);
-    
+
     if (isset($lead_info['custom_fields_values']) && is_array($lead_info['custom_fields_values'])) {
         foreach ($lead_info['custom_fields_values'] as $field) {
             if (($field['field_id'] ?? 0) == $target_field_id) {
@@ -195,30 +216,48 @@ try {
         }
     }
     write_log('ТЕКУЩЕЕ ЗНАЧЕНИЕ ПОЛЯ', ['current_enum_id' => $current_enum_id]);
-    
+
 } catch (Exception $e) {
     write_log('Не удалось получить текущее значение', ['error' => $e->getMessage()]);
 }
 
-// --- 6. Обновляем если нужно ---
-if ($current_enum_id === $enum_id) {
-    write_log('ОБНОВЛЕНИЕ НЕ ТРЕБУЕТСЯ - значение уже правильное', [
-        'lead_id' => $lead_id,
-        'enum_id' => $enum_id
-    ]);
+// --- 6. Формируем и отправляем обновление ---
+$custom_fields = [];
+
+// Канал — обновляем только если изменился
+if ($current_enum_id !== $enum_id) {
+    $custom_fields[] = [
+        'field_id' => $target_field_id,
+        'values'   => [['enum_id' => $enum_id]],
+    ];
+} else {
+    write_log('Канал не изменился, пропускаем', ['enum_id' => $enum_id]);
+}
+
+// UTM-метки — пишем в каждое поле из маппинга
+foreach ($utm_values as $utm_key => $utm_val) {
+    foreach ($utm_field_map[$utm_key] as $field_id) {
+        $custom_fields[] = [
+            'field_id' => $field_id,
+            'values'   => [['value' => $utm_val]],
+        ];
+    }
+}
+
+write_log('ПОЛЯ ДЛЯ ОБНОВЛЕНИЯ', [
+    'channel_changed' => ($current_enum_id !== $enum_id),
+    'utm_values'      => $utm_values,
+    'fields_count'    => count($custom_fields),
+]);
+
+if (empty($custom_fields)) {
+    write_log('Нечего обновлять — канал совпадает, UTM отсутствуют');
 } else {
     $leadsData = [
-        'id' => $lead_id,
-        'custom_fields_values' => [
-            [
-                'field_id' => $target_field_id,
-                'values' => [
-                    ['enum_id' => $enum_id]
-                ]
-            ]
-        ]
+        'id'                  => $lead_id,
+        'custom_fields_values' => $custom_fields,
     ];
-    
+
     try {
         $result = post_or_patch(
             $subdomain,
@@ -227,19 +266,18 @@ if ($current_enum_id === $enum_id) {
             $GLOBALS['data'],
             'PATCH'
         );
-        
-        write_log('УСПЕХ: Поле обновлено', [
-            'lead_id' => $lead_id,
-            'old_value' => $current_enum_id,
-            'new_value' => $enum_id,
+
+        write_log('УСПЕХ: Сделка обновлена', [
+            'lead_id'      => $lead_id,
             'channel_name' => $channel_name,
-            'found_by' => $found_by
+            'utm_values'   => $utm_values,
+            'found_by'     => $found_by,
         ]);
-        
+
     } catch (Exception $e) {
         write_log('ОШИБКА при обновлении', [
-            'error' => $e->getMessage(),
-            'lead_id' => $lead_id
+            'error'   => $e->getMessage(),
+            'lead_id' => $lead_id,
         ]);
     }
 }

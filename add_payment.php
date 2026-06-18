@@ -871,8 +871,11 @@ try {
                 'bill_payment_date' => $bill_payment_date,
             ]);
 
-            // Проверяем, что счет оплачен
-            if ($bill_status !== 'Оплачен' && strpos(strtolower($bill_status ?? ''), 'оплач') === false) {
+            // Проверяем, что счет оплачен или является возвратом
+            $status_lower = mb_strtolower(trim($bill_status ?? ''));
+            $is_paid   = str_contains($status_lower, 'оплачен') && !str_contains($status_lower, 'не оплачен');
+            $is_refund = str_contains($status_lower, 'возврат');
+            if (!$is_paid && !$is_refund) {
                 log_payment_info("Счет не оплачен, пропускаем обработку", ['bill_status' => $bill_status]);
                 http_response_code(200);
                 echo json_encode([
@@ -1314,22 +1317,106 @@ try {
     }
 
     // =========================================================================
+    // ОБРАБОТКА ВОЗВРАТА: меняем статус существующего платежа на Unpaid
+    // =========================================================================
+    if ($is_refund ?? false) {
+        log_payment_info("Обработка возврата: ищем существующий платёж для изменения статуса", [
+            'clientId' => $client_id,
+            'amount'   => $amount,
+        ]);
+
+        $payments_result = call_hollyhop_api('GetPayments', [
+            'clientId' => $client_id,
+        ], $auth_key, $api_base_url);
+
+        $existing_payments = $payments_result['Items'] ?? $payments_result['Payments'] ?? $payments_result['items'] ?? [];
+
+        // Ищем последний Paid-платёж с совпадающей суммой
+        $target_payment = null;
+        foreach (array_reverse($existing_payments) as $pay) {
+            $pay_state = $pay['State'] ?? $pay['state'] ?? null;
+            $pay_value = (float)($pay['Value'] ?? $pay['value'] ?? 0);
+            if ($pay_state === 'Paid' && abs($pay_value - (float)$amount) < 0.01) {
+                $target_payment = $pay;
+                break;
+            }
+        }
+
+        // Если по сумме не нашли — берём просто последний Paid
+        if (!$target_payment) {
+            foreach (array_reverse($existing_payments) as $pay) {
+                $pay_state = $pay['State'] ?? $pay['state'] ?? null;
+                if ($pay_state === 'Paid') {
+                    $target_payment = $pay;
+                    break;
+                }
+            }
+        }
+
+        if (!$target_payment) {
+            log_payment_warning("Возврат: оплаченный платёж не найден в Hollyhop", [
+                'clientId'       => $client_id,
+                'payments_count' => count($existing_payments),
+            ]);
+            http_response_code(200);
+            echo json_encode([
+                'success' => false,
+                'message' => 'Возврат: оплаченный платёж не найден в Hollyhop',
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        $payment_id = $target_payment['Id'] ?? $target_payment['id'];
+        log_payment_info("Возврат: найден платёж для изменения статуса", [
+            'paymentId' => $payment_id,
+            'value'     => $target_payment['Value'] ?? $target_payment['value'] ?? null,
+            'state'     => $target_payment['State'] ?? $target_payment['state'] ?? null,
+        ]);
+
+        $edit_result = call_hollyhop_api('EditPayment', [
+            'id'               => $payment_id,
+            'clientId'         => $target_payment['ClientId'] ?? $client_id,
+            'officeOrCompanyId'=> $target_payment['OfficeOrCompanyId'] ?? $office_id,
+            'date'             => $target_payment['Date'] ?? date('Y-m-d'),
+            'value'            => $target_payment['ValueQuantity'] ?? (float)$amount,
+            'paymentMethodId'  => $target_payment['PaymentMethodId'] ?? null,
+            'type'             => $target_payment['Type'] ?? null,
+            'state'            => 'Unpaid',
+            'description'      => 'ВОЗВРАТ',
+        ], $auth_key, $api_base_url);
+
+        log_payment_info("✓ Возврат: статус платежа изменён на Unpaid", [
+            'paymentId' => $payment_id,
+            'clientId'  => $client_id,
+        ]);
+
+        http_response_code(200);
+        echo json_encode([
+            'success'      => true,
+            'message'      => 'Возврат: статус платежа изменён на Unpaid',
+            'paymentId'    => $payment_id,
+            'api_response' => $edit_result,
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    // =========================================================================
     // ФОРМИРОВАНИЕ И ОТПРАВКА ОПЛАТЫ
     // =========================================================================
 
     function mapAmoStatusToHollyState(string $amoStatus): string
     {
-        $amoStatus = mb_strtolower(trim($amoStatus));
+        $s = mb_strtolower(trim($amoStatus));
         return match (true) {
-            str_contains($amoStatus, 'оплачен') => 'Unconfirmed',
-            str_contains($amoStatus, 'част')    => 'Unconfirmed',
-            str_contains($amoStatus, 'не оплачен') => 'Unpaid',
-            str_contains($amoStatus, 'отмен')   => 'Unpaid',
-            default => 'Unconfirmed'
+            str_contains($s, 'не оплачен')        => 'Unpaid',
+            str_contains($s, 'отмен')              => 'Unpaid',
+            str_contains($s, 'возврат')            => 'Paid',
+            str_contains($s, 'оплачен')            => 'Paid',
+            default                                => 'Unconfirmed'
         };
     }
 
-    $payment_state     = isset($bill_status) ? mapAmoStatusToHollyState($bill_status) : 'Unconfirmed';
+    $payment_state = isset($bill_status) ? mapAmoStatusToHollyState($bill_status) : 'Unconfirmed';
     $payment_method_id = !empty($payment_link) ? 23 : 19; // Тбанк (23) или ПСБ (19)
 
     log_payment_info("Формирование параметров для AddPayment", [
