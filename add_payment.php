@@ -1585,12 +1585,6 @@ try {
         if ($source_payment_id) {
             $refund_description_parts[] = 'по платежу #' . $source_payment_id;
         }
-        if (!empty($catalog_element_id)) {
-            $refund_description_parts[] = 'по счету amo #' . (int) $catalog_element_id;
-        }
-        if (!empty($lead_id)) {
-            $refund_description_parts[] = 'по сделке #' . (int) $lead_id;
-        }
 
         $refund_description = implode(' ', $refund_description_parts);
         $refund_result = create_hollyhop_refund_via_web_form(
