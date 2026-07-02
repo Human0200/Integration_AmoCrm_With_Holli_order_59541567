@@ -37,7 +37,8 @@ $client_type_to_name = [
     '6' => 'WhatsApp',
     '8' => 'MAX',      // Facebook -> max SB
     '10' => 'Instagram',
-    '13' => 'MAX'      // Телефония -> max SB
+    '13' => 'MAX',     // Телефония -> max SB
+    '20' => 'MAX',     // TamTam -> max SB
 ];
 
 function write_log($message, $data = []) {
@@ -63,10 +64,16 @@ if (!$salebot_data) {
     exit;
 }
 
-// Извлекаем данные
-$amo_unsorted_id = $salebot_data['client']['variables']['amo_unsorted_id'] ?? null;
-$amo_client_id = $salebot_data['client']['variables']['amo_client_id'] ?? null;
-$amo_lead_id = $salebot_data['client']['order_variables']['amo_lead_id'] ?? null;
+// Извлекаем данные (ищем в variables и order_variables)
+$amo_unsorted_id = $salebot_data['client']['variables']['amo_unsorted_id']
+    ?? $salebot_data['client']['order_variables']['amo_unsorted_id']
+    ?? null;
+$amo_client_id = $salebot_data['client']['variables']['amo_client_id']
+    ?? $salebot_data['client']['order_variables']['amo_client_id']
+    ?? null;
+$amo_lead_id = $salebot_data['client']['order_variables']['amo_lead_id']
+    ?? $salebot_data['client']['variables']['amo_lead_id']
+    ?? null;
 $client_type = $salebot_data['client']['client_type'] ?? null;
 
 // Также проверяем поле messenger если есть

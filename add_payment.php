@@ -513,6 +513,7 @@ function find_lead_by_catalog_link(
 $api_config = get_config('api');
 $auth_key = $api_config['auth_key'];
 $api_base_url = $api_config['base_url'];
+$hollyhop_subdomain = $api_config['subdomain'] ?? null;
 
 // Допустимые методы запроса
 header('Access-Control-Allow-Methods: POST, OPTIONS');
@@ -590,6 +591,193 @@ function call_hollyhop_api($function_name, $params, $auth_key, $api_base_url)
     }
 
     return $result;
+}
+
+function perform_hollyhop_web_request(string $url, string $cookie_file, ?array $post_pairs = null): array
+{
+    $ch = curl_init();
+
+    $options = [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_COOKIEJAR => $cookie_file,
+        CURLOPT_COOKIEFILE => $cookie_file,
+    ];
+
+    if ($post_pairs !== null) {
+        $encoded_pairs = [];
+        foreach ($post_pairs as [$key, $value]) {
+            $encoded_pairs[] = rawurlencode((string) $key) . '=' . rawurlencode((string) $value);
+        }
+
+        $post_body = implode('&', $encoded_pairs);
+
+        $options[CURLOPT_POST] = true;
+        $options[CURLOPT_POSTFIELDS] = $post_body;
+        $options[CURLOPT_HTTPHEADER] = [
+            'Content-Type: application/x-www-form-urlencoded',
+            'Content-Length: ' . strlen($post_body),
+        ];
+    }
+
+    curl_setopt_array($ch, $options);
+
+    $response = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curl_error = curl_error($ch);
+
+    curl_close($ch);
+
+    if ($curl_error) {
+        throw new Exception("Ошибка web-запроса Hollyhop: {$curl_error}");
+    }
+
+    if ($http_code >= 400) {
+        throw new Exception("Hollyhop web-запрос вернул HTTP {$http_code}: " . substr((string) $response, 0, 500));
+    }
+
+    return [
+        'http_code' => $http_code,
+        'body' => (string) $response,
+    ];
+}
+
+function create_hollyhop_web_session(string $hollyhop_subdomain, string $auth_key): string
+{
+    $cookie_dir = __DIR__ . '/logs';
+    if (!is_dir($cookie_dir) && !@mkdir($cookie_dir, 0755, true) && !is_dir($cookie_dir)) {
+        throw new Exception('Не удалось создать директорию для cookie-файлов Hollyhop.');
+    }
+
+    try {
+        $random_suffix = bin2hex(random_bytes(8));
+    } catch (Throwable $e) {
+        $random_suffix = uniqid('', true);
+    }
+
+    $cookie_file = $cookie_dir . '/hollyhop_web_' . $random_suffix . '.cookie';
+    if (@file_put_contents($cookie_file, '') === false) {
+        throw new Exception('Не удалось создать cookie-файл Hollyhop в директории проекта.');
+    }
+
+    $auth_url = "https://{$hollyhop_subdomain}.t8s.ru/Account/AuthByKey?authkey=" . rawurlencode($auth_key);
+    perform_hollyhop_web_request($auth_url, $cookie_file);
+
+    return $cookie_file;
+}
+
+function extract_hollyhop_form_value(string $html, string $name, ?string $default = null): ?string
+{
+    $quoted_name = preg_quote($name, '/');
+    $patterns = [
+        '/<input[^>]*name="' . $quoted_name . '"[^>]*value="([^"]*)"/ui',
+        '/<textarea[^>]*name="' . $quoted_name . '"[^>]*>(.*?)<\/textarea>/uis',
+        '/<select[^>]*name="' . $quoted_name . '"[^>]*>.*?<option[^>]*selected(?:="selected"|=\'selected\')?[^>]*value="([^"]*)"/uis',
+    ];
+
+    foreach ($patterns as $pattern) {
+        if (preg_match($pattern, $html, $matches)) {
+            return html_entity_decode($matches[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+    }
+
+    return $default;
+}
+
+function create_hollyhop_refund_via_web_form(
+    string $hollyhop_subdomain,
+    string $auth_key,
+    int $payer_id,
+    int $office_id,
+    float $amount,
+    int $payment_method_id,
+    string $description,
+    string $date_iso
+): array {
+    $cookie_file = create_hollyhop_web_session($hollyhop_subdomain, $auth_key);
+
+    try {
+        $form_url = "https://{$hollyhop_subdomain}.t8s.ru/Payment/EditStudyRefund?payerId={$payer_id}";
+        $form_response = perform_hollyhop_web_request($form_url, $cookie_file);
+        $form_html = $form_response['body'];
+
+        $bill_number = extract_hollyhop_form_value($form_html, 'BillNumber');
+        if ($bill_number === null || $bill_number === '') {
+            throw new Exception('Не удалось получить BillNumber из формы возврата Hollyhop.');
+        }
+
+        $clndr_begin_date = extract_hollyhop_form_value($form_html, 'ClndrUnits.BeginDate', date('d.m.Y 0:00:00', strtotime($date_iso)));
+        $date_for_form = date('Y-m-d\T00:00:00', strtotime($date_iso));
+        $amount_for_form = number_format(abs($amount), 2, ',', '');
+
+        $post_pairs = [
+            ['Id', '0'],
+            ['PayerId', (string) $payer_id],
+            ['StudentId', ''],
+            ['Date', $date_for_form],
+            ['BillNumber', $bill_number],
+            ['AbstractSchoolId', (string) $office_id],
+            ['PriceType', 'Hourly'],
+            ['PriceType', 'Packet'],
+            ['EstimatedDate', ''],
+            ['Units.Units', '0'],
+            ['Units.UnitsMultiplier', '1'],
+            ['Units.PartialUnits', '1'],
+            ['Units.NonPartialMultiplier', '1'],
+            ['Units.NonPartialUnits', '1'],
+            ['Units.AcademHourId', '1'],
+            ['ClndrUnits.BeginDate', $clndr_begin_date],
+            ['ClndrUnits.Months', '0'],
+            ['ClndrUnits.Days', '1'],
+            ['ClndrUnits.ClndrMultiplier', '1'],
+            ['ClndrUnits.PartialMonths', '0'],
+            ['ClndrUnits.PartialDays', '1'],
+            ['ClndrUnits.ClndrNonPartialMultiplier', '1'],
+            ['ClndrUnits.ClndrNonPartialUnits', ''],
+            ['Value', $amount_for_form],
+            ['RestoredValue', '0'],
+            ['CurrencyAllId', '0'],
+            ['CurrencyRealId', '0'],
+            ['Currency.Id', '0'],
+            ['PaymentMethod.Id', (string) $payment_method_id],
+            ['PaymentMethod.Id', ''],
+            ['Description', $description],
+        ];
+
+        $submit_url = "https://{$hollyhop_subdomain}.t8s.ru/Payment/EditStudyRefund";
+        $submit_response = perform_hollyhop_web_request($submit_url, $cookie_file, $post_pairs);
+        $response_body = $submit_response['body'];
+
+        $success_redirect = '/Payment/Payer/' . $payer_id;
+        if (!str_contains($response_body, $success_redirect)) {
+            $validation_error = null;
+            if (preg_match('/<span[^>]*field-validation-error[^>]*>(.*?)<\/span>/uis', $response_body, $matches)) {
+                $validation_error = trim(html_entity_decode(strip_tags($matches[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            }
+
+            if (!$validation_error && preg_match('/<div[^>]*validation-summary-errors[^>]*>.*?<li[^>]*>(.*?)<\/li>/uis', $response_body, $matches)) {
+                $validation_error = trim(html_entity_decode(strip_tags($matches[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            }
+
+            throw new Exception(
+                'Hollyhop не подтвердил создание возврата через web-форму.'
+                . ($validation_error ? ' Ошибка: ' . $validation_error : '')
+            );
+        }
+
+        return [
+            'billNumber' => $bill_number,
+            'request' => $post_pairs,
+            'responsePreview' => substr($response_body, 0, 300),
+        ];
+    } finally {
+        if (is_file($cookie_file)) {
+            @unlink($cookie_file);
+        }
+    }
 }
 
 /**
@@ -1214,12 +1402,19 @@ try {
     $student_info = null;
 
     try {
-        $api_response = call_hollyhop_api('GetStudents', ['clientId' => $client_id], $auth_key, $api_base_url);
+        $student_lookup_params = $resolved_profile_id
+            ? ['Id' => $resolved_profile_id]
+            : ['clientId' => $client_id];
+
+        $api_response = call_hollyhop_api('GetStudents', $student_lookup_params, $auth_key, $api_base_url);
 
         if (is_array($api_response)) {
             if (isset($api_response['Students']) && is_array($api_response['Students'])) {
                 foreach ($api_response['Students'] as $student) {
-                    if (is_array($student) && ($student['ClientId'] ?? $student['clientId'] ?? null) == $client_id) {
+                    $matches_client_id = ($student['ClientId'] ?? $student['clientId'] ?? null) == $client_id;
+                    $matches_profile_id = $resolved_profile_id && (($student['Id'] ?? $student['id'] ?? null) == $resolved_profile_id);
+
+                    if (is_array($student) && ($matches_client_id || $matches_profile_id)) {
                         $student_info = $student;
                         break;
                     }
@@ -1228,7 +1423,10 @@ try {
                 $student_info = $api_response;
             } else {
                 foreach ($api_response as $student) {
-                    if (is_array($student) && ($student['ClientId'] ?? $student['clientId'] ?? null) == $client_id) {
+                    $matches_client_id = ($student['ClientId'] ?? $student['clientId'] ?? null) == $client_id;
+                    $matches_profile_id = $resolved_profile_id && (($student['Id'] ?? $student['id'] ?? null) == $resolved_profile_id);
+
+                    if (is_array($student) && ($matches_client_id || $matches_profile_id)) {
                         $student_info = $student;
                         break;
                     }
@@ -1263,6 +1461,14 @@ try {
             ]);
             $office_id = 36; // Филиал по умолчанию
         }
+
+        log_payment_info("Определен филиал ученика для платежа", [
+            'clientId' => $client_id,
+            'profileId' => $resolved_profile_id,
+            'student_lookup_params' => $student_lookup_params,
+            'officeId' => $office_id,
+            'offices' => $student_info['OfficesAndCompanies'] ?? null,
+        ]);
     } catch (Exception $e) {
         if (!isset($office_id) || $office_id === null) {
             log_payment_error("✗ Ошибка при получении officeOrCompanyId", [
@@ -1317,10 +1523,10 @@ try {
     }
 
     // =========================================================================
-    // ОБРАБОТКА ВОЗВРАТА: меняем статус существующего платежа на Unpaid
+    // ОБРАБОТКА ВОЗВРАТА: создаем отдельный платеж возврата в Hollyhop
     // =========================================================================
     if ($is_refund ?? false) {
-        log_payment_info("Обработка возврата: ищем существующий платёж для изменения статуса", [
+        log_payment_info("Обработка возврата: готовим отдельный платеж возврата в Hollyhop", [
             'clientId' => $client_id,
             'amount'   => $amount,
         ]);
@@ -1354,48 +1560,64 @@ try {
         }
 
         if (!$target_payment) {
-            log_payment_warning("Возврат: оплаченный платёж не найден в Hollyhop", [
+            log_payment_warning("Возврат: исходный оплаченный платёж не найден, создаем возврат без привязки к исходному paymentId", [
                 'clientId'       => $client_id,
                 'payments_count' => count($existing_payments),
             ]);
-            http_response_code(200);
-            echo json_encode([
-                'success' => false,
-                'message' => 'Возврат: оплаченный платёж не найден в Hollyhop',
-            ], JSON_UNESCAPED_UNICODE);
-            exit;
         }
 
-        $payment_id = $target_payment['Id'] ?? $target_payment['id'];
-        log_payment_info("Возврат: найден платёж для изменения статуса", [
-            'paymentId' => $payment_id,
-            'value'     => $target_payment['Value'] ?? $target_payment['value'] ?? null,
-            'state'     => $target_payment['State'] ?? $target_payment['state'] ?? null,
-        ]);
+        $source_payment_id = $target_payment['Id'] ?? $target_payment['id'] ?? null;
+        if ($source_payment_id) {
+            log_payment_info("Возврат: найден исходный платёж", [
+                'paymentId' => $source_payment_id,
+                'value'     => $target_payment['Value'] ?? $target_payment['value'] ?? null,
+                'state'     => $target_payment['State'] ?? $target_payment['state'] ?? null,
+            ]);
+        }
 
-        $edit_result = call_hollyhop_api('EditPayment', [
-            'id'               => $payment_id,
-            'clientId'         => $target_payment['ClientId'] ?? $client_id,
-            'officeOrCompanyId'=> $target_payment['OfficeOrCompanyId'] ?? $office_id,
-            'date'             => $target_payment['Date'] ?? date('Y-m-d'),
-            'value'            => $target_payment['ValueQuantity'] ?? (float)$amount,
-            'paymentMethodId'  => $target_payment['PaymentMethodId'] ?? null,
-            'type'             => $target_payment['Type'] ?? null,
-            'state'            => 'Unpaid',
-            'description'      => 'ВОЗВРАТ',
-        ], $auth_key, $api_base_url);
+        $refund_payment_method_id = $target_payment['PaymentMethodId'] ?? $payment_method_id ?? (!empty($payment_link) ? 23 : 19);
+        $refund_description_parts = ['Возврат'];
 
-        log_payment_info("✓ Возврат: статус платежа изменён на Unpaid", [
-            'paymentId' => $payment_id,
+        if (empty($hollyhop_subdomain)) {
+            throw new Exception('Не задан subdomain Hollyhop для создания возврата через web-форму.');
+        }
+
+        if ($source_payment_id) {
+            $refund_description_parts[] = 'по платежу #' . $source_payment_id;
+        }
+        if (!empty($catalog_element_id)) {
+            $refund_description_parts[] = 'по счету amo #' . (int) $catalog_element_id;
+        }
+        if (!empty($lead_id)) {
+            $refund_description_parts[] = 'по сделке #' . (int) $lead_id;
+        }
+
+        $refund_description = implode(' ', $refund_description_parts);
+        $refund_result = create_hollyhop_refund_via_web_form(
+            $hollyhop_subdomain,
+            $auth_key,
+            (int) $client_id,
+            (int) $office_id,
+            (float) $amount,
+            (int) $refund_payment_method_id,
+            $refund_description,
+            $date_iso
+        );
+
+        log_payment_info("✓ Возврат: платеж успешно создан через внутреннюю web-форму Hollyhop", [
             'clientId'  => $client_id,
+            'sourcePaymentId' => $source_payment_id,
+            'paymentMethodId' => $refund_payment_method_id,
+            'billNumber' => $refund_result['billNumber'] ?? null,
         ]);
 
         http_response_code(200);
         echo json_encode([
             'success'      => true,
-            'message'      => 'Возврат: статус платежа изменён на Unpaid',
-            'paymentId'    => $payment_id,
-            'api_response' => $edit_result,
+            'message'      => 'Возврат: платеж успешно создан через внутреннюю web-форму Hollyhop',
+            'sourcePaymentId' => $source_payment_id,
+            'billNumber'   => $refund_result['billNumber'] ?? null,
+            'api_response' => $refund_result,
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         exit;
     }

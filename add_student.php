@@ -202,6 +202,14 @@ function build_student_extra_fields_from_post_data($post_data)
     return $extra_fields;
 }
 
+function sanitize_holly_name(string $name): string
+{
+    // Hollyhop принимает только буквы, дефис, апостроф, пробел
+    $clean = preg_replace('/[^\p{L}\s\-\']/u', '', $name);
+    $clean = trim((string)$clean);
+    return $clean !== '' ? $clean : '-';
+}
+
 function split_full_name($full_name)
 {
     $full_name = trim((string)$full_name);
@@ -491,8 +499,8 @@ try {
 
     // Подготавливаем параметры для API
     // Если имя или фамилия не указаны, используем прочерки
-    $firstName = $student_name['firstName'] !== '' ? $student_name['firstName'] : '-';
-    $lastName = $student_name['lastName'] !== '' ? $student_name['lastName'] : '-';
+    $firstName = sanitize_holly_name($student_name['firstName'] !== '' ? $student_name['firstName'] : '-');
+    $lastName  = sanitize_holly_name($student_name['lastName']  !== '' ? $student_name['lastName']  : '-');
 
     $student_params = [
         'firstName' => $firstName,
@@ -562,7 +570,6 @@ try {
             'Мини группа' => 'Мини-группа',
             'Мини-группа' => 'Мини-группа',
             'Минигруппа' => 'Мини-группа',
-            'Мини группа' => 'Мини-группа',
             'Стандарт' => 'Стандарт',
             'Индивидуальный' => 'Индивидуальный',
             'Индивидуальные' => 'Индивидуальный',
@@ -895,8 +902,8 @@ if (!empty($post_data['officeOrCompanyId'])) {
                 ];
 
                 foreach ($search_attempts as $attempt) {
+                    $param_name = array_key_first($attempt);
                     try {
-                        $param_name = array_key_first($attempt);
                         log_message("Попытка поиска с параметром: {$param_name}", $attempt);
 
                         $search_response = call_hollyhop_api('GetStudents', $attempt, $auth_key, $api_base_url);
@@ -919,6 +926,24 @@ if (!empty($post_data['officeOrCompanyId'])) {
                                 $candidates = [$search_response];
                             } elseif (isset($search_response['Students']) && is_array($search_response['Students'])) {
                                 $candidates = $search_response['Students'];
+                            }
+                        }
+
+                        // Если поиск по параметру `phone` вернул результаты — доверяем им
+                        // напрямую. Телефон в Hollyhop хранится в системе Agents/Contacts
+                        // и не всегда присутствует в полях student-объекта, поэтому
+                        // повторная проверка по полям Phone/phone ниже может дать 0 совпадений
+                        // и привести к созданию дубликата.
+                        if ($param_name === 'phone' && count($candidates) === 1) {
+                            $trusted = $candidates[0];
+                            if (is_array($trusted)) {
+                                log_message("✓ phone-поиск вернул 1 студента, используем напрямую без перепроверки телефона", [
+                                    'Id'       => $trusted['Id'] ?? $trusted['id'] ?? null,
+                                    'ClientId' => $trusted['ClientId'] ?? $trusted['clientId'] ?? null,
+                                ]);
+                                $existing_student = $trusted;
+                                $is_update = true;
+                                break 2; // выходим из foreach $search_phones и foreach $search_attempts
                             }
                         }
 
@@ -1035,6 +1060,7 @@ if (!empty($post_data['officeOrCompanyId'])) {
         unset($student_params['ClientId']);
 
         // Отправляем запрос к API для создания студента
+        log_message("AddStudent params", $student_params, 'INFO');
         $result = call_hollyhop_api('AddStudent', $student_params, $auth_key, $api_base_url);
 
         // Проверяем, что результат получен
