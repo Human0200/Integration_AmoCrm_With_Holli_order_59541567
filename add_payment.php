@@ -821,6 +821,88 @@ function update_lead_profile_link_in_amocrm(int $lead_id, string $profile_link, 
     post_or_patch($subdomain, $lead_update, "/api/v4/leads/{$lead_id}", $data, 'PATCH');
 }
 
+function normalize_pipeline_name(string $value): string
+{
+    $value = mb_strtolower(trim($value), 'UTF-8');
+    $value = str_replace('ё', 'е', $value);
+    return (string) preg_replace('/\s+/u', ' ', $value);
+}
+
+function fetch_pipeline_name_by_id(string $subdomain, array $data, ?int $pipeline_id): ?string
+{
+    if (!$pipeline_id) {
+        return null;
+    }
+
+    try {
+        $pipeline = get($subdomain, '/api/v4/leads/pipelines/' . $pipeline_id, $data);
+    } catch (Exception $e) {
+        log_payment_warning("Не удалось получить название воронки по pipeline_id", [
+            'pipeline_id' => $pipeline_id,
+            'error' => $e->getMessage(),
+        ]);
+        return null;
+    }
+
+    $pipeline_name = trim((string) ($pipeline['name'] ?? ''));
+    return $pipeline_name !== '' ? $pipeline_name : null;
+}
+
+function resolve_payment_type_by_pipeline(?int $pipeline_id, ?string $pipeline_name = null): ?string
+{
+    if ($pipeline_id) {
+        $payment_type_by_id = match ($pipeline_id) {
+            9719942 => 'языковой лагерь за рубежом',
+            8117846 => 'обучение за рубежом. поступление в вуз',
+            default => null,
+        };
+
+        if ($payment_type_by_id !== null) {
+            return $payment_type_by_id;
+        }
+    }
+
+    $normalized_name = $pipeline_name !== null ? normalize_pipeline_name($pipeline_name) : '';
+    if ($normalized_name === '') {
+        return null;
+    }
+
+    return match (true) {
+        str_contains($normalized_name, 'лагер') && str_contains($normalized_name, 'рубеж') => 'языковой лагерь за рубежом',
+        str_contains($normalized_name, 'поступлен') && str_contains($normalized_name, 'вуз') => 'обучение за рубежом. поступление в вуз',
+        str_contains($normalized_name, 'обучение за рубежом') => 'обучение за рубежом. поступление в вуз',
+        str_contains($normalized_name, 'курс') || str_contains($normalized_name, 'общая') => 'обучение',
+        default => null,
+    };
+}
+
+function has_non_empty_amo_field(array $custom_fields_values, int $target_field_id): bool
+{
+    foreach ($custom_fields_values as $field) {
+        if ((int) ($field['field_id'] ?? 0) !== $target_field_id) {
+            continue;
+        }
+
+        foreach (($field['values'] ?? []) as $value_row) {
+            $value = $value_row['value'] ?? null;
+
+            if (is_string($value) && trim($value) !== '') {
+                return true;
+            }
+
+            if (is_numeric($value)) {
+                return true;
+            }
+
+            if (is_array($value) && !empty($value)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 /**
  * Вызывает index.php передавая lead_id в формате вебхука AmoCRM (leads add).
  * index.php содержит полную логику поиска существующего студента и создания нового.
@@ -1505,21 +1587,22 @@ try {
     // ОПРЕДЕЛЕНИЕ TYPE ПЛАТЕЖА ПО ВОРОНКЕ
     // =========================================================================
     $payment_type = null;
-    $pipeline_id = $LEAD['pipeline_id'] ?? null;
+    $pipeline_id = isset($LEAD['pipeline_id']) ? (int) $LEAD['pipeline_id'] : null;
+    $pipeline_name = fetch_pipeline_name_by_id($subdomain, $data, $pipeline_id);
+    $payment_type = resolve_payment_type_by_pipeline($pipeline_id, $pipeline_name);
+    $use_studyridge_acquiring = has_non_empty_amo_field($custom_fields_values, 1638129);
 
-    if ($pipeline_id) {
-        $payment_type = match ($pipeline_id) {
-            9719942 => 'языковой лагерь за рубежом',
-            8117846 => 'обучение за рубежом. индивидуальное',
-            default => null
-        };
-
-        if ($payment_type) {
-            log_payment_info("Определен type платежа по воронке", [
-                'pipeline_id' => $pipeline_id,
-                'payment_type' => $payment_type
-            ]);
-        }
+    if ($payment_type) {
+        log_payment_info("Определен type платежа по воронке", [
+            'pipeline_id' => $pipeline_id,
+            'pipeline_name' => $pipeline_name,
+            'payment_type' => $payment_type,
+        ]);
+    } else {
+        log_payment_warning("Не удалось определить type платежа по воронке", [
+            'pipeline_id' => $pipeline_id,
+            'pipeline_name' => $pipeline_name,
+        ]);
     }
 
     // =========================================================================
@@ -1620,20 +1703,10 @@ try {
     // ФОРМИРОВАНИЕ И ОТПРАВКА ОПЛАТЫ
     // =========================================================================
 
-    function mapAmoStatusToHollyState(string $amoStatus): string
-    {
-        $s = mb_strtolower(trim($amoStatus));
-        return match (true) {
-            str_contains($s, 'не оплачен')        => 'Unpaid',
-            str_contains($s, 'отмен')              => 'Unpaid',
-            str_contains($s, 'возврат')            => 'Paid',
-            str_contains($s, 'оплачен')            => 'Paid',
-            default                                => 'Unconfirmed'
-        };
-    }
-
-    $payment_state = isset($bill_status) ? mapAmoStatusToHollyState($bill_status) : 'Unconfirmed';
-    $payment_method_id = !empty($payment_link) ? 23 : 19; // Тбанк (23) или ПСБ (19)
+    $payment_state = 'Paid';
+    $payment_method_id = $use_studyridge_acquiring
+        ? 25
+        : (!empty($payment_link) ? 23 : 19);
 
     log_payment_info("Формирование параметров для AddPayment", [
         'clientId'           => $client_id,
@@ -1641,10 +1714,13 @@ try {
         'amount'             => $amount,
         'date_iso'           => $date_iso,
         'payment_method_id'  => $payment_method_id,
-        'payment_method_name' => $payment_method_id == 23 ? 'Тбанк (23)' : 'ПСБ (19)',
+        'payment_method_name' => $payment_method_id === 25
+            ? 'ОП. ООО Стадиридж эквайринг (25)'
+            : ($payment_method_id === 23 ? 'ОП. Эквайринг. Тбанк (23)' : 'ОП. ООО ЦПВ "Евразия". безналичные (19)'),
         'payment_state'      => $payment_state,
         'payment_type'       => $payment_type,
-        'pipeline_id'        => $pipeline_id
+        'pipeline_id'        => $pipeline_id,
+        'field_1638129_filled' => $use_studyridge_acquiring,
     ]);
 
     $payment_params = [
