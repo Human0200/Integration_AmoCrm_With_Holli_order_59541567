@@ -31,6 +31,7 @@ const AMO_FIELD_CONTRACT_LINK     = 1632483;
 
 const AMO_CONTACT_FIELD_PHONE = 1138327;
 const AMO_CONTACT_FIELD_EMAIL = 1138329;
+const AMO_CONTACT_FIELD_TELEGRAM = 1630032;
 const AMO_CONTACT_FIELD_CHILD_NAME = 1635263;
 const AMO_CONTACT_FIELD_CHILD_BIRTHDATE = 1635265;
 
@@ -87,7 +88,7 @@ if (isset($_GET['payment_webhook']) && $_GET['payment_webhook'] === '1') {
             throw new Exception("Не удалось отправить данные студента в Hollyhop");
         }
 
-        $clientId    = $hollyhopResponse['clientId'] ?? null;
+        $clientId    = resolveClientIdForHollyhopSync($hollyhopResponse, $lead);
         $profileLink = $hollyhopResponse['link'] ?? null;
         $profileId   = $hollyhopResponse['Id'] ?? $hollyhopResponse['id'] ?? null;
 
@@ -96,7 +97,8 @@ if (isset($_GET['payment_webhook']) && $_GET['payment_webhook'] === '1') {
             updateLeadProfileLink($leadId, $profileLink);
         }
 
-        // Обновляем поле "Сделки АМО" если есть clientId
+        // Обновляем поле "Сделки АМО" и "Договор Оки" даже если clientId
+        // пришлось восстановить по существующему профилю Hollyhop.
         if ($clientId !== null) {
             updateHollyhopAmoDeal($clientId, $leadId, $lead);
         }
@@ -257,15 +259,21 @@ if (isset($_GET['document']) && $_GET['document'] === 'true') {
 
 log_info("Вебхук от AmoCRM получен", $_POST, 'index.php');
 
-$leadId = extractLeadIdFromWebhook($_POST);
+$webhookContext = extractLeadWebhookContext($_POST);
 
-if ($leadId === null) {
+if ($webhookContext === null) {
     log_warning("Вебхук получен, но не удалось определить lead_id", $_POST, 'index.php');
     exit;
 }
 
+$leadId = $webhookContext['lead_id'];
+$webhookLock = acquireAmoWebhookLock($webhookContext);
+if ($webhookLock === false) {
+    exit;
+}
+
 try {
-    processAmoCrmLead($leadId);
+    processAmoCrmLead($leadId, $webhookContext['event_type']);
 } catch (Exception $e) {
     log_error("Критическая ошибка при обработке сделки", [
         'lead_id' => $leadId,
@@ -273,6 +281,8 @@ try {
         'trace'   => $e->getTraceAsString()
     ], 'index.php');
     die("Ошибка: " . $e->getMessage());
+} finally {
+    releaseAmoWebhookLock($webhookLock);
 }
 
 // ============================================================================
@@ -561,31 +571,133 @@ function updateContactInfo(int $contactId, ?string $name, ?string $email, ?strin
 // ФУНКЦИИ ОБРАБОТКИ AMOCRM
 // ============================================================================
 
-function extractLeadIdFromWebhook(array $post): ?int
+function extractLeadWebhookContext(array $post): ?array
 {
     if (isset($post["leads"]["add"][0]["id"])) {
         $leadId = (int) $post["leads"]["add"][0]["id"];
         log_info("Обработка события: создание новой сделки", ['lead_id' => $leadId], 'index.php');
-        return $leadId;
+        return [
+            'lead_id' => $leadId,
+            'event_type' => 'add',
+            'last_modified' => (string) ($post["leads"]["add"][0]["last_modified"] ?? ''),
+        ];
     }
 
     if (isset($post["leads"]["status"][0]["id"])) {
         $leadId = (int) $post["leads"]["status"][0]["id"];
         log_info("Обработка события: изменение статуса сделки", ['lead_id' => $leadId], 'index.php');
-        return $leadId;
+        return [
+            'lead_id' => $leadId,
+            'event_type' => 'status',
+            'last_modified' => (string) ($post["leads"]["status"][0]["last_modified"] ?? ''),
+        ];
+    }
+
+    if (isset($post["leads"]["update"][0]["id"])) {
+        $leadId = (int) $post["leads"]["update"][0]["id"];
+        log_info("Обработка события: обновление сделки", ['lead_id' => $leadId], 'index.php');
+        return [
+            'lead_id' => $leadId,
+            'event_type' => 'update',
+            'last_modified' => (string) ($post["leads"]["update"][0]["last_modified"] ?? ''),
+        ];
     }
 
     return null;
 }
 
-function processAmoCrmLead(int $leadId): void
+function acquireAmoWebhookLock(array $webhookContext): array|false|null
 {
-    syncLeadToHollyhop($leadId);
+    $leadId = (int) ($webhookContext['lead_id'] ?? 0);
+    $lastModified = trim((string) ($webhookContext['last_modified'] ?? ''));
+    $eventType = (string) ($webhookContext['event_type'] ?? 'unknown');
+
+    if ($leadId <= 0 || $lastModified === '') {
+        return null;
+    }
+
+    $lockDir = __DIR__ . '/locks';
+    if (!is_dir($lockDir) && !@mkdir($lockDir, 0755, true) && !is_dir($lockDir)) {
+        log_warning("Не удалось создать директорию locks для вебхука AmoCRM, продолжаем без дедупликации", [
+            'lock_dir' => $lockDir,
+            'lead_id' => $leadId,
+            'event_type' => $eventType,
+        ], 'index.php');
+        return null;
+    }
+
+    $lockKey = "lead_sync_{$leadId}_{$lastModified}";
+    $lockFile = $lockDir . '/amo_webhook_' . md5($lockKey) . '.lock';
+    $lockFp = @fopen($lockFile, 'c');
+    if ($lockFp === false) {
+        log_warning("Не удалось открыть lock-файл вебхука AmoCRM, продолжаем без дедупликации", [
+            'lock_file' => $lockFile,
+            'lead_id' => $leadId,
+            'event_type' => $eventType,
+        ], 'index.php');
+        return null;
+    }
+
+    if (!@flock($lockFp, LOCK_EX | LOCK_NB)) {
+        log_info("Дубликат webhook-события AmoCRM пропущен по lock", [
+            'lead_id' => $leadId,
+            'event_type' => $eventType,
+            'last_modified' => $lastModified,
+            'lock_key' => $lockKey,
+        ], 'index.php');
+        fclose($lockFp);
+        return null;
+    }
+
+    log_info("Захвачен lock для webhook-события AmoCRM", [
+        'lead_id' => $leadId,
+        'event_type' => $eventType,
+        'last_modified' => $lastModified,
+        'lock_key' => $lockKey,
+    ], 'index.php');
+
+    return [
+        'fp' => $lockFp,
+        'lock_key' => $lockKey,
+        'lead_id' => $leadId,
+        'event_type' => $eventType,
+    ];
 }
 
-function syncLeadToHollyhop(int $leadId, bool $suppressOutput = false): void
+function releaseAmoWebhookLock(mixed $lock): void
+{
+    if (!is_array($lock) || !isset($lock['fp']) || !is_resource($lock['fp'])) {
+        return;
+    }
+
+    @flock($lock['fp'], LOCK_UN);
+    fclose($lock['fp']);
+
+    log_info("Освобожден lock для webhook-события AmoCRM", [
+        'lead_id' => $lock['lead_id'] ?? null,
+        'event_type' => $lock['event_type'] ?? null,
+        'lock_key' => $lock['lock_key'] ?? null,
+    ], 'index.php');
+}
+
+function processAmoCrmLead(int $leadId, string $eventType = 'unknown'): void
 {
     $lead = fetchLeadData($leadId);
+
+    if ($eventType === 'update' && !hasFilledProfileLink($lead)) {
+        log_info("Webhook update пропущен: поле 'Ссылка на Холи' не заполнено", [
+            'lead_id' => $leadId,
+            'event_type' => $eventType,
+        ], 'index.php');
+        return;
+    }
+
+    syncLeadToHollyhop($leadId, false, $lead);
+}
+
+function syncLeadToHollyhop(int $leadId, bool $suppressOutput = false, ?array $lead = null): void
+{
+    $lead ??= fetchLeadData($leadId);
 
     if (!hasRequiredLeadData($lead)) {
         log_warning("Сделка не содержит достаточно данных для обработки", [
@@ -644,6 +756,20 @@ function hasRequiredLeadData(array $lead): bool
     return true;
 }
 
+function hasFilledProfileLink(array $lead): bool
+{
+    foreach ($lead["custom_fields_values"] ?? [] as $field) {
+        if (($field["field_id"] ?? null) !== AMO_FIELD_PROFILE_LINK) {
+            continue;
+        }
+
+        $value = trim((string) ($field["values"][0]["value"] ?? ''));
+        return $value !== '';
+    }
+
+    return false;
+}
+
 function buildStudentDataFromLead(array $lead, int $leadId): array
 {
     global $subdomain;
@@ -699,6 +825,9 @@ function extractLeadCustomFields(array $customFieldsValues): array
             case AMO_FIELD_RESPONSIBLE_USER:
                 $fields["responsible_user"] = $value;
                 break;
+            case AMO_CONTACT_FIELD_TELEGRAM:
+                $fields["telegram"] = $value;
+                break;
             case AMO_FIELD_PROFILE_LINK:
                 if (preg_match('/\/Profile\/(\d+)/', (string) $value, $m)) {
                     $fields["existing_profile_id"] = (int) $m[1];
@@ -731,6 +860,9 @@ function extractContactData(int $contactId): array
                 }
                 if ($fieldId === AMO_CONTACT_FIELD_EMAIL && $value !== null) {
                     $contactData["email"] = $value;
+                }
+                if ($fieldId === AMO_CONTACT_FIELD_TELEGRAM && $value !== null) {
+                    $contactData["telegram"] = $value;
                 }
                 if ($fieldId === AMO_CONTACT_FIELD_CHILD_NAME && $value !== null) {
                     $contactData["childName"] = $value;
@@ -863,17 +995,16 @@ function processHollyhopResponse(array $response, int $leadId, array $lead): voi
             'response' => $response,
             'lead_id'  => $leadId
         ], 'index.php');
-        return;
+    } else {
+        log_info("Ссылка на профиль студента получена", [
+            'link'    => $profileLink,
+            'lead_id' => $leadId
+        ], 'index.php');
+
+        updateLeadProfileLink($leadId, $profileLink);
     }
 
-    log_info("Ссылка на профиль студента получена", [
-        'link'    => $profileLink,
-        'lead_id' => $leadId
-    ], 'index.php');
-
-    updateLeadProfileLink($leadId, $profileLink);
-
-    $clientId = $response["clientId"] ?? null;
+    $clientId = resolveClientIdForHollyhopSync($response, $lead);
     if ($clientId !== null) {
         updateHollyhopAmoDeal($clientId, $leadId, $lead);
     } else {
@@ -934,6 +1065,81 @@ function extractContractLinkFromLead(array $lead): ?string
             return $field["values"][0]["value"] ?? null;
         }
     }
+    return null;
+}
+
+function extractProfileIdFromLead(array $lead): ?int
+{
+    foreach ($lead["custom_fields_values"] ?? [] as $field) {
+        if (($field["field_id"] ?? null) !== AMO_FIELD_PROFILE_LINK) {
+            continue;
+        }
+
+        $value = (string) ($field["values"][0]["value"] ?? '');
+        if ($value !== '' && preg_match('/\/Profile\/(\d+)/', $value, $matches)) {
+            return (int) $matches[1];
+        }
+    }
+
+    return null;
+}
+
+function resolveClientIdForHollyhopSync(array $response, array $lead): ?int
+{
+    $responseClientId = $response["clientId"] ?? $response["ClientId"] ?? null;
+    if (is_numeric($responseClientId) && (int) $responseClientId > 0) {
+        return (int) $responseClientId;
+    }
+
+    $profileId = null;
+
+    $responseProfileId = $response["Id"] ?? $response["id"] ?? null;
+    if (is_numeric($responseProfileId) && (int) $responseProfileId > 0) {
+        $profileId = (int) $responseProfileId;
+    }
+
+    if ($profileId === null) {
+        $profileId = extractProfileIdFromLead($lead);
+    }
+
+    if ($profileId === null) {
+        return null;
+    }
+
+    try {
+        $apiConfig = get_config('api');
+        $authKey = $apiConfig['auth_key'];
+        $apiBaseUrl = $apiConfig['base_url'];
+        $student = callHollyhopApi('GetStudents', ['Id' => $profileId], $authKey, $apiBaseUrl);
+
+        $candidates = [];
+        if (isset($student['ClientId']) || isset($student['clientId'])) {
+            $candidates[] = $student;
+        } elseif (isset($student['Students']) && is_array($student['Students'])) {
+            $candidates = $student['Students'];
+        } elseif (is_array($student) && isset($student[0])) {
+            $candidates = $student;
+        }
+
+        foreach ($candidates as $candidate) {
+            $candidateProfileId = $candidate['Id'] ?? $candidate['id'] ?? null;
+            $candidateClientId = $candidate['ClientId'] ?? $candidate['clientId'] ?? null;
+
+            if (is_numeric($candidateProfileId) && (int) $candidateProfileId === $profileId && is_numeric($candidateClientId) && (int) $candidateClientId > 0) {
+                log_info("clientId восстановлен по profile_id для синхронизации полей Hollyhop", [
+                    'profile_id' => $profileId,
+                    'clientId'   => (int) $candidateClientId
+                ], 'index.php');
+                return (int) $candidateClientId;
+            }
+        }
+    } catch (Exception $e) {
+        log_warning("Не удалось восстановить clientId по profile_id для синхронизации полей Hollyhop", [
+            'profile_id' => $profileId,
+            'error'      => $e->getMessage()
+        ], 'index.php');
+    }
+
     return null;
 }
 

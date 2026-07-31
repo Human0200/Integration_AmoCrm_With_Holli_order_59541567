@@ -183,6 +183,13 @@ function build_student_extra_fields_from_post_data($post_data)
         ];
     }
 
+    if (!empty($post_data['telegram'])) {
+        $extra_fields[] = [
+            'name' => 'Телеграмм',
+            'value' => trim((string)$post_data['telegram'])
+        ];
+    }
+
     $child_birth_date = '';
     if (!empty($post_data['Дата рождения'])) {
         $child_birth_date = trim((string)$post_data['Дата рождения']);
