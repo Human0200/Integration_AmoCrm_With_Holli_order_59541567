@@ -92,13 +92,27 @@ try {
     $action = '';
 
     if ($amoLeadId > 0) {
-        updateCoordinatorLead($amoLeadId, $studentData, $routing);
-        $amoLeadUrl = buildAmoLeadUrl($amoLeadId);
-        $action = 'updated';
-        coordinator_log_info('Обновлена существующая сделка amo ОС', [
-            'amo_lead_id' => $amoLeadId
-        ]);
-    } else {
+        try {
+            updateCoordinatorLead($amoLeadId, $studentData, $routing);
+            $amoLeadUrl = buildAmoLeadUrl($amoLeadId);
+            $action = 'updated';
+            coordinator_log_info('Обновлена существующая сделка amo ОС', [
+                'amo_lead_id' => $amoLeadId
+            ]);
+        } catch (Throwable $e) {
+            // В поле "Ссылка на AMO (ОС)" может лежать id удаленной или чужой
+            // сделки — тогда создаем новую, а не роняем вебхук.
+            if (!isLeadNotFoundAmoError($e->getMessage())) {
+                throw $e;
+            }
+            coordinator_log_warning('Сделка amo ОС из поля "Ссылка на AMO (ОС)" не найдена в amoCRM, создаем новую', [
+                'amo_lead_id' => $amoLeadId
+            ]);
+            $amoLeadId = 0;
+        }
+    }
+
+    if ($amoLeadId <= 0) {
         $createdLead = createCoordinatorLead($studentData, $routing);
         $amoLeadId = (int) ($createdLead['id'] ?? 0);
         if ($amoLeadId <= 0) {
@@ -383,7 +397,7 @@ function normalizeCoordinatorStudent(array $student, array $payload): array
     $amoOsLink = trim((string) getHollyFieldValue(
         $student,
         [HOLLY_FIELD_AMO_OS > 0 ? HOLLY_FIELD_AMO_OS : null],
-        ['АМО (ОС)', 'АМО(ОС)']
+        ['Ссылка на AMO (ОС)', 'АМО (ОС)', 'АМО(ОС)']
     ));
 
     // Дополнительный контакт: плательщик.
@@ -595,6 +609,15 @@ function coordinatorAmoRequestWithFieldRetry(string $path, array $lead, string $
             $attempt++;
         }
     }
+}
+
+/**
+ * true, если amoCRM ответил "Lead not found" — сделка удалена или id из
+ * чужой/старой базы, обновлять нечего.
+ */
+function isLeadNotFoundAmoError(string $message): bool
+{
+    return mb_stripos($message, 'Lead not found', 0, 'UTF-8') !== false;
 }
 
 /**
@@ -838,9 +861,10 @@ function updateHollyAmoOsField(array $student, array $studentData, string $amoLe
         return;
     }
 
-    // После создания/обновления сделки записываем ссылку обратно в Hollyhop, в поле "АМО (ОС)".
+    // После создания/обновления сделки записываем ссылку обратно в Hollyhop.
+    // В Hollihop поле называется именно "Ссылка на AMO (ОС)" (проверено по ExtraFields студента).
     $targetFieldId = HOLLY_FIELD_AMO_OS;
-    $fieldName = 'АМО (ОС)';
+    $fieldName = 'Ссылка на AMO (ОС)';
     $fields = [];
     $replaced = false;
 
