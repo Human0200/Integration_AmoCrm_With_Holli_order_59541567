@@ -32,6 +32,8 @@ $amo_users = get ($subdomain, $api_url, $data);
 **/
 date_default_timezone_set("Europe/Moscow");
 
+require_once __DIR__ . '/config.php';
+
 // Подключаем логгер, если он еще не подключен
 if (!function_exists('log_message')) {
     if (file_exists(__DIR__ . '/logger.php')) {
@@ -39,11 +41,11 @@ if (!function_exists('log_message')) {
     }
 }
 
-$client_id = '423c1efc-1b6e-470d-ae84-34f69b4adf25';
-$client_secret = 's2pQFJkE6A347PvGyz5eJeyHAvKP2stfXvoSNSpKKnZyW4NfcBUFXp7rGfm7xXnq';
-$redirect_uri = 'https://srm.chinatutor.ru/hook.php';
-$subdomain = 'directorchinatutorru';
-$oauth_token = 'def50200cae7fac384409d01ff8393de246ae1c86f49675a37463d22235e9630bdca41f9d30083ca607dbc374e7662c0fd72e46d267b807c1a64a050cdf154409e73bb306e5443a3a0c5442ec7a183a930c023cc8003ad9d54bae75b8879ce8965f1d20c06af5355a82aec207a8a91e56861c25573732abecaaa2d47729228102610b9adce4efd491294f720405d312d55bd61f33e835f99c3d62343c6399e94d508b29a8f2e5c9dce81ca8a6466b020a0246627a9589340c7741e4ac23635f18a0a96be672bb616a321bcd4e2309c5ac10b049e79ca9efcdbd618763f58b3fb9fc1226815acdbf2a043d9bf93fb5ffddca3b256e8547440d022e29480c72ac195525bc581d2ed006595fe732c5feb69e766ca13524043e8d255c190c704382ff6b00fa62df420417bb530ca58a32f917d00f3bf9fe903cff3f425b472e3fe8d5d6e6b9b69ec273837dce83b172bd263a23b37abfa529e9b9c32bc7b62e09b7eeadbfbfa6b853ca71e088feda44f0dae8a03c5296a56acfc179f3d803d0a646a9fe71acd69f6c7d3fe9e76d77f028088d5a85852752f92e3ec2a1b678ca27f0b447d18b7f10da5ba90a608dde599b0d572e5f172d62cf93352f4a7260b1a9bca14d81d019e412692885f72d68d4b1286538aaa58b8c8bd7063bf73e21b0d0ac2c3d6eca1f1df0a10584b338a8006ce743e27740f';
+$client_id = (string) get_config('amocrm.client_id');
+$client_secret = (string) get_config('amocrm.client_secret');
+$redirect_uri = (string) get_config('amocrm.redirect_uri');
+$subdomain = (string) get_config('amocrm.subdomain');
+$oauth_token = (string) ($_GET['code'] ?? '');
 
 // auth
 $data = json_decode(file_get_contents(__DIR__.'/tokens.json'), 1);
@@ -105,34 +107,118 @@ if (time() - (int) $data['time'] > 82800) {
 }
 // auth
 
+function amo_api_rate_limit_delay_seconds(): float
+{
+    return 0.2;
+}
+
+function amo_api_max_retry_attempts(): int
+{
+    return 4;
+}
+
+function amo_api_wait_for_slot(): void
+{
+    $lockDir = __DIR__ . '/locks';
+    if (!is_dir($lockDir)) {
+        @mkdir($lockDir, 0755, true);
+    }
+
+    $lockFile = $lockDir . '/amo_api_rate_limit.lock';
+    $fp = @fopen($lockFile, 'c+');
+    if (!$fp) {
+        usleep((int) round(amo_api_rate_limit_delay_seconds() * 1000000));
+        return;
+    }
+
+    if (!flock($fp, LOCK_EX)) {
+        fclose($fp);
+        usleep((int) round(amo_api_rate_limit_delay_seconds() * 1000000));
+        return;
+    }
+
+    $contents = stream_get_contents($fp);
+    $lastRequestAt = is_string($contents) ? (float) trim($contents) : 0.0;
+    $now = microtime(true);
+    $minInterval = amo_api_rate_limit_delay_seconds();
+    $elapsed = $now - $lastRequestAt;
+
+    if ($lastRequestAt > 0 && $elapsed < $minInterval) {
+        usleep((int) round(($minInterval - $elapsed) * 1000000));
+    }
+
+    $currentTime = microtime(true);
+    ftruncate($fp, 0);
+    rewind($fp);
+    fwrite($fp, sprintf('%.6f', $currentTime));
+    fflush($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+}
+
+function amo_api_retry_delay_seconds(int $attempt): float
+{
+    $delays = [
+        1 => 0.5,
+        2 => 1.0,
+        3 => 1.5,
+        4 => 2.0,
+    ];
+
+    return $delays[$attempt] ?? 2.5;
+}
+
 function get ($subdomain, $url, $data) {
     $link = 'https://' . $subdomain . '.amocrm.ru'.$url;
     $access_token = $data['access_token'];
     $headers = [
         'Authorization: Bearer ' . $access_token
     ];
-    // echo print_r($headers).'<br><br>';
-    $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
-    curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
-    curl_setopt($curl,CURLOPT_URL, $link);
-    curl_setopt($curl,CURLOPT_HTTPHEADER, $headers);
-    curl_setopt($curl,CURLOPT_HEADER, false);
-    curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
-    curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
-    $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
-    $code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    curl_close($curl);
-    $code = (int)$code;
     $errors = [
         400 => 'Bad request',
         401 => 'Unauthorized',
         403 => 'Forbidden',
         404 => 'Not found',
+        429 => 'Too Many Requests',
         500 => 'Internal server error',
         502 => 'Bad gateway',
         503 => 'Service unavailable',
     ];
+
+    $out = '';
+    $code = 0;
+
+    for ($attempt = 1; $attempt <= amo_api_max_retry_attempts(); $attempt++) {
+        amo_api_wait_for_slot();
+
+        $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
+        curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
+        curl_setopt($curl,CURLOPT_URL, $link);
+        curl_setopt($curl,CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($curl,CURLOPT_HEADER, false);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
+        $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
+        $code = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+
+        if ($code !== 429) {
+            break;
+        }
+
+        if (function_exists('log_warning')) {
+            log_warning("AmoCRM вернул 429 на GET, повторяем запрос", [
+                'attempt' => $attempt,
+                'url' => $url,
+                'retry_in_seconds' => amo_api_retry_delay_seconds($attempt),
+            ], 'amo_func.php');
+        }
+
+        if ($attempt < amo_api_max_retry_attempts()) {
+            usleep((int) round(amo_api_retry_delay_seconds($attempt) * 1000000));
+        }
+    }
 
     try
     {
@@ -157,7 +243,7 @@ function get ($subdomain, $url, $data) {
     //     echo $out.'<br>';
     // }
     $result = json_decode($out, true);
-    return $result;
+    return is_array($result) ? $result : (($code >= 200 && $code <= 204) ? [] : null);
 }
 
 function post_or_patch ($subdomain, $query_data, $url, $data, $method) {
@@ -169,35 +255,59 @@ function post_or_patch ($subdomain, $query_data, $url, $data, $method) {
         'Authorization: Bearer ' . $access_token,
         'Content-Type: application/json',
     ];
-    $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
-    curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
-    curl_setopt($curl,CURLOPT_URL, $link);
-    curl_setopt($curl, CURLOPT_CUSTOMREQUEST, $method);
-    curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($query_data));
-    curl_setopt($curl,CURLOPT_HTTPHEADER, $headers);
-    curl_setopt($curl,CURLOPT_HEADER, false);
-    curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
-    curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
-    $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
-    $code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    // echo $code.'<br>';
-    // echo $out.'<br>';
-    curl_close($curl);
-    $code = (int)$code;
+    $payload = json_encode($query_data);
     $errors = array(
         301 => 'Moved permanently',
         400 => 'Bad request',
         401 => 'Unauthorized',
         403 => 'Forbidden',
         404 => 'Not found',
+        429 => 'Too Many Requests',
         500 => 'Internal server error',
         502 => 'Bad gateway',
         503 => 'Service unavailable',
     );
+
+    $out = '';
+    $code = 0;
+
+    for ($attempt = 1; $attempt <= amo_api_max_retry_attempts(); $attempt++) {
+        amo_api_wait_for_slot();
+
+        $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
+        curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
+        curl_setopt($curl,CURLOPT_URL, $link);
+        curl_setopt($curl, CURLOPT_CUSTOMREQUEST, $method);
+        curl_setopt($curl, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($curl,CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($curl,CURLOPT_HEADER, false);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
+        $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
+        $code = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+
+        if ($code !== 429) {
+            break;
+        }
+
+        if (function_exists('log_warning')) {
+            log_warning("AmoCRM вернул 429 на {$method}, повторяем запрос", [
+                'attempt' => $attempt,
+                'url' => $url,
+                'retry_in_seconds' => amo_api_retry_delay_seconds($attempt),
+            ], 'amo_func.php');
+        }
+
+        if ($attempt < amo_api_max_retry_attempts()) {
+            usleep((int) round(amo_api_retry_delay_seconds($attempt) * 1000000));
+        }
+    }
+
     try
     {
-        if ($code != 200 && $code != 204) {
+        if ($code < 200 || $code > 204) {
             if (function_exists('log_error')) {
                 log_error("Ошибка {$method} запроса к AmoCRM API", ['code' => $code, 'method' => $method, 'url' => $url, 'error' => isset($errors[$code]) ? $errors[$code] : 'Undescribed error', 'response' => substr($out, 0, 500)], 'amo_func.php');
             }
@@ -213,7 +323,5 @@ function post_or_patch ($subdomain, $query_data, $url, $data, $method) {
         die('Ошибка: ' . $E->getMessage() . PHP_EOL . 'Код ошибки: ' . $E->getCode());
     }
     $result = json_decode($out, true);
-    return $result;
+    return is_array($result) ? $result : (($code >= 200 && $code <= 204) ? [] : null);
 }
-
-

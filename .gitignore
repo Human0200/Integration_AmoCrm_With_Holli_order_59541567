@@ -4,3 +4,4 @@
 *.docx
 *.json
 *.env
+locks/

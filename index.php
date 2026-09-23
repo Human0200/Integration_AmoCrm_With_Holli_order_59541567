@@ -15,6 +15,33 @@ declare(strict_types=1);
 require_once __DIR__ . '/logger.php';
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/amo_func.php';
+require_once __DIR__ . '/zoom/zoom_integration.php';
+require_once __DIR__ . '/zoom_salesbot_reminders.php';
+
+$amoWorkerMode = null;
+$amoWorkerPayloadFile = null;
+if (PHP_SAPI === 'cli' && isset($argv) && is_array($argv)) {
+    foreach ($argv as $argument) {
+        if (str_starts_with($argument, '--amo-worker=')) {
+            $amoWorkerMode = substr($argument, strlen('--amo-worker='));
+        }
+        if (str_starts_with($argument, '--amo-payload=')) {
+            $amoWorkerPayloadFile = substr($argument, strlen('--amo-payload='));
+        }
+    }
+
+    if ($amoWorkerPayloadFile !== null && is_file($amoWorkerPayloadFile)) {
+        $workerPayload = json_decode((string) file_get_contents($amoWorkerPayloadFile), true);
+        if (is_array($workerPayload)) {
+            $_POST = $workerPayload;
+        }
+        @unlink($amoWorkerPayloadFile);
+    }
+
+    if ($amoWorkerMode === 'document') {
+        $_GET['document'] = 'true';
+    }
+}
 
 // ============================================================================
 // КОНСТАНТЫ
@@ -23,15 +50,38 @@ require_once __DIR__ . '/amo_func.php';
 const AMO_FIELD_DISCIPLINE    = 1575217;
 const AMO_FIELD_LEVEL         = 1576357;
 const AMO_FIELD_LEARNING_TYPE = 1575221;
+const AMO_FIELD_LESSON_KIND   = 1575317;
+const AMO_FIELD_LEARNING_FORMAT = 1606825;
 const AMO_FIELD_MATURITY      = 1575213;
 const AMO_FIELD_OFFICE_OR_COMPANY = 1596219;
 const AMO_FIELD_RESPONSIBLE_USER  = 1590693;
 const AMO_FIELD_PROFILE_LINK      = 1630807;
 const AMO_FIELD_CONTRACT_LINK     = 1632483;
 
+// Индивидуальные параметры обучения из полей сделки amoCRM.
+const AMO_FIELD_PACKAGE = 1639037;
+const AMO_FIELD_LESSONS_COUNT = 1639039;
+const AMO_FIELD_PACKAGE_TERM = 1639041;
+const AMO_FIELD_INTENSITY = 1639043;
+const AMO_FIELD_LESSON_DURATION = 1639047;
+const AMO_FIELD_LESSON_LOCATION = 1639049;
+const AMO_FIELD_TEACHER = 1639051;
+const AMO_FIELD_SLOT_FIXED = 1639053;
+const AMO_FIELD_SCHEDULE = 1639055;
+const AMO_FIELD_DISCOUNT = 1639057;
+const AMO_FIELD_VIP = 1639059;
+const AMO_FIELD_LESSON_PRICE = 1639061;
+const AMO_FIELD_TOTAL_PRICE = 1639063;
+const AMO_FIELD_COMBO_ACTIVE = 1639065;
+const AMO_FIELD_LANGUAGE_CLUB = 1639067;
+const AMO_FIELD_TRANSFER_LIMIT = 1639069;
+const AMO_FIELD_FREE_PAUSE = 1639071;
+const AMO_FIELD_SECOND_PAYMENT_DUE = 1639073;
+
 const AMO_CONTACT_FIELD_PHONE = 1138327;
 const AMO_CONTACT_FIELD_EMAIL = 1138329;
 const AMO_CONTACT_FIELD_TELEGRAM = 1630032;
+const AMO_CONTACT_FIELD_EMERGENCY_PHONE = 1575287;
 const AMO_CONTACT_FIELD_CHILD_NAME = 1635263;
 const AMO_CONTACT_FIELD_CHILD_BIRTHDATE = 1635265;
 
@@ -92,10 +142,9 @@ if (isset($_GET['payment_webhook']) && $_GET['payment_webhook'] === '1') {
         $profileLink = $hollyhopResponse['link'] ?? null;
         $profileId   = $hollyhopResponse['Id'] ?? $hollyhopResponse['id'] ?? null;
 
-        if ($profileLink) {
-            // Записываем ссылку на профиль в сделку AmoCRM
-            updateLeadProfileLink($leadId, $profileLink);
-        }
+        // document=true нужен только для передачи договора в Hollyhop.
+        // Повторный PATCH ссылки на профиль здесь создает новый update webhook
+        // и запускает бесконечную цепочку.
 
         // Обновляем поле "Сделки АМО" и "Договор Оки" даже если clientId
         // пришлось восстановить по существующему профилю Hollyhop.
@@ -162,6 +211,16 @@ if (isset($_GET['document']) && $_GET['document'] === 'true') {
 
     if (!$leadId) {
         log_error("Не удалось определить lead_id", $_POST, 'index.php');
+        exit;
+    }
+
+    if ($amoWorkerMode === null) {
+        if (!claimWebhookCooldown('document', $leadId, 30)) {
+            acknowledgeAmoWebhook();
+            exit;
+        }
+        spawnAmoWebhookWorker('document', $_POST);
+        acknowledgeAmoWebhook();
         exit;
     }
 
@@ -267,10 +326,22 @@ if ($webhookContext === null) {
 }
 
 $leadId = $webhookContext['lead_id'];
+$isBackgroundAmoWorker = $amoWorkerMode !== null;
+
 $webhookLock = acquireAmoWebhookLock($webhookContext);
 if ($webhookLock === false) {
+    acknowledgeAmoWebhook();
     exit;
 }
+
+if (!$isBackgroundAmoWorker) {
+    log_info("Обычный webhook будет обработан в текущем процессе после быстрого ответа", [
+        'lead_id' => $leadId,
+        'event_type' => $webhookContext['event_type'],
+    ], 'index.php');
+}
+
+acknowledgeAmoWebhook();
 
 try {
     processAmoCrmLead($leadId, $webhookContext['event_type']);
@@ -280,7 +351,6 @@ try {
         'error'   => $e->getMessage(),
         'trace'   => $e->getTraceAsString()
     ], 'index.php');
-    die("Ошибка: " . $e->getMessage());
 } finally {
     releaseAmoWebhookLock($webhookLock);
 }
@@ -292,6 +362,94 @@ try {
 function isOkiDokiSignedContract(?array $data): bool
 {
     return isset($data['status']) && $data['status'] === 'signed';
+}
+
+function acknowledgeAmoWebhook(): void
+{
+    http_response_code(200);
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Connection: close');
+    echo "OK";
+
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+        return;
+    }
+
+    if (ob_get_level() > 0) {
+        ob_end_flush();
+    }
+    flush();
+}
+
+function spawnAmoWebhookWorker(string $mode, array $payload): void
+{
+    $runtimeDir = __DIR__ . '/locks';
+    if (!is_dir($runtimeDir)) {
+        @mkdir($runtimeDir, 0755, true);
+    }
+
+    $payloadFile = tempnam($runtimeDir, 'amo_webhook_');
+    if ($payloadFile === false) {
+        throw new RuntimeException('Не удалось создать временный файл для фоновой обработки webhook.');
+    }
+
+    $encodedPayload = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    if ($encodedPayload === false || file_put_contents($payloadFile, $encodedPayload) === false) {
+        @unlink($payloadFile);
+        throw new RuntimeException('Не удалось сохранить payload webhook для фоновой обработки.');
+    }
+
+    $command = sprintf(
+        '%s %s --amo-worker=%s --amo-payload=%s > /dev/null 2>&1 &',
+        escapeshellarg(PHP_BINARY),
+        escapeshellarg(__FILE__),
+        escapeshellarg($mode),
+        escapeshellarg($payloadFile)
+    );
+
+    if (function_exists('exec')) {
+        exec($command);
+    } elseif (function_exists('popen')) {
+        $process = @popen($command, 'r');
+        if (is_resource($process)) {
+            pclose($process);
+        } else {
+            throw new RuntimeException('Не удалось запустить фоновый worker webhook.');
+        }
+    } else {
+        throw new RuntimeException('На сервере отключены exec и popen.');
+    }
+
+    log_info("Webhook передан в фоновую обработку", [
+        'mode' => $mode,
+        'payload_file' => $payloadFile,
+    ], 'index.php');
+}
+
+function claimWebhookCooldown(string $type, int $leadId, int $seconds): bool
+{
+    $lockDir = __DIR__ . '/locks';
+    if (!is_dir($lockDir)) {
+        @mkdir($lockDir, 0755, true);
+    }
+
+    $stateFile = $lockDir . "/{$type}_webhook_{$leadId}.state";
+    $now = time();
+    $lastRun = is_file($stateFile) ? (int) trim((string) @file_get_contents($stateFile)) : 0;
+
+    if ($lastRun > 0 && ($now - $lastRun) < $seconds) {
+        log_info("Webhook пропущен по cooldown", [
+            'type' => $type,
+            'lead_id' => $leadId,
+            'seconds' => $seconds,
+            'last_run_at' => date('c', $lastRun),
+        ], 'index.php');
+        return false;
+    }
+
+    @file_put_contents($stateFile, (string) $now, LOCK_EX);
+    return true;
 }
 
 function handleOkiDokiSignedContract(array $okiData): void
@@ -440,12 +598,42 @@ function normalizeOkiDateForAmo(?string $value): ?string
         return $value;
     }
 
+    if (preg_match('/^\d{13}$/', $value)) {
+        return date('Y-m-d', (int) floor(((int) $value) / 1000));
+    }
+
+    if (preg_match('/^\d{9,10}$/', $value)) {
+        return date('Y-m-d', (int) $value);
+    }
+
     if (preg_match('/^(\d{2})\.(\d{2})\.(\d{4})$/', $value, $matches)) {
         return $matches[3] . '-' . $matches[2] . '-' . $matches[1];
     }
 
     if (preg_match('/^(\d{2})\/(\d{2})\/(\d{4})$/', $value, $matches)) {
         return $matches[3] . '-' . $matches[2] . '-' . $matches[1];
+    }
+
+    return $value;
+}
+
+function normalizeHollyCustomDateValue($value): string
+{
+    $value = trim((string) $value);
+    if ($value === '') {
+        return '';
+    }
+
+    if (preg_match('/^\d{13}$/', $value)) {
+        return date('d.m.Y', (int) floor(((int) $value) / 1000));
+    }
+
+    if (preg_match('/^\d{9,10}$/', $value)) {
+        return date('d.m.Y', (int) $value);
+    }
+
+    if (preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $value, $matches)) {
+        return $matches[3] . '.' . $matches[2] . '.' . $matches[1];
     }
 
     return $value;
@@ -682,7 +870,20 @@ function releaseAmoWebhookLock(mixed $lock): void
 
 function processAmoCrmLead(int $leadId, string $eventType = 'unknown'): void
 {
+    // Выполняем просроченные агенты на каждом обращении к webhook.
+    try {
+        $agentResult = zoom_salesbot_run_agents();
+        if (($agentResult['sent'] ?? 0) > 0 || ($agentResult['errors'] ?? 0) > 0) {
+            log_info('Агенты Salesbot Zoom обработаны на хите', $agentResult, 'index.php');
+        }
+    } catch (Throwable $exception) {
+        log_error('Ошибка обработки агентов Salesbot Zoom на хите', ['error' => $exception->getMessage()], 'index.php');
+    }
+
     $lead = fetchLeadData($leadId);
+
+    zoom_salesbot_capture_lead($lead);
+    zoom_process_amo_lead($leadId, $lead, $eventType);
 
     if ($eventType === 'update' && !hasFilledProfileLink($lead)) {
         log_info("Webhook update пропущен: поле 'Ссылка на Холи' не заполнено", [
@@ -816,6 +1017,14 @@ function extractLeadCustomFields(array $customFieldsValues): array
             case AMO_FIELD_LEARNING_TYPE:
                 $fields["learningType"] = $value;
                 break;
+            case AMO_FIELD_LESSON_KIND:
+                $fields["lessonKind"] = $value;
+                $fields["learningType"] = $value;
+                break;
+            case AMO_FIELD_LEARNING_FORMAT:
+                $fields["learningFormat"] = $value;
+                $fields["learningType"] = $value;
+                break;
             case AMO_FIELD_MATURITY:
                 $fields["maturity"] = $value;
                 break;
@@ -832,6 +1041,60 @@ function extractLeadCustomFields(array $customFieldsValues): array
                 if (preg_match('/\/Profile\/(\d+)/', (string) $value, $m)) {
                     $fields["existing_profile_id"] = (int) $m[1];
                 }
+                break;
+            case AMO_FIELD_PACKAGE:
+                $fields["hollyPackage"] = $value;
+                break;
+            case AMO_FIELD_LESSONS_COUNT:
+                $fields["hollyLessonsCount"] = $value;
+                break;
+            case AMO_FIELD_PACKAGE_TERM:
+                $fields["hollyPackageTerm"] = $value;
+                break;
+            case AMO_FIELD_INTENSITY:
+                $fields["hollyIntensity"] = $value;
+                break;
+            case AMO_FIELD_LESSON_DURATION:
+                $fields["hollyLessonDuration"] = $value;
+                break;
+            case AMO_FIELD_LESSON_LOCATION:
+                $fields["hollyLessonLocation"] = $value;
+                break;
+            case AMO_FIELD_TEACHER:
+                $fields["hollyTeacher"] = $value;
+                break;
+            case AMO_FIELD_SLOT_FIXED:
+                $fields["hollySlotFixed"] = $value;
+                break;
+            case AMO_FIELD_SCHEDULE:
+                $fields["hollySchedule"] = $value;
+                break;
+            case AMO_FIELD_DISCOUNT:
+                $fields["hollyDiscount"] = $value;
+                break;
+            case AMO_FIELD_VIP:
+                $fields["hollyVip"] = $value;
+                break;
+            case AMO_FIELD_LESSON_PRICE:
+                $fields["hollyLessonPrice"] = $value;
+                break;
+            case AMO_FIELD_TOTAL_PRICE:
+                $fields["hollyTotalPrice"] = $value;
+                break;
+            case AMO_FIELD_COMBO_ACTIVE:
+                $fields["hollyComboActive"] = $value;
+                break;
+            case AMO_FIELD_LANGUAGE_CLUB:
+                $fields["hollyLanguageClub"] = $value;
+                break;
+            case AMO_FIELD_TRANSFER_LIMIT:
+                $fields["hollyTransferLimit"] = $value;
+                break;
+            case AMO_FIELD_FREE_PAUSE:
+                $fields["hollyFreePause"] = $value;
+                break;
+            case AMO_FIELD_SECOND_PAYMENT_DUE:
+                $fields["hollySecondPaymentDue"] = $value;
                 break;
         }
     }
@@ -864,16 +1127,21 @@ function extractContactData(int $contactId): array
                 if ($fieldId === AMO_CONTACT_FIELD_TELEGRAM && $value !== null) {
                     $contactData["telegram"] = $value;
                 }
+                if ($fieldId === AMO_CONTACT_FIELD_EMERGENCY_PHONE && $value !== null) {
+                    $contactData["parentEmergencyPhone"] = $value;
+                }
                 if ($fieldId === AMO_CONTACT_FIELD_CHILD_NAME && $value !== null) {
                     $contactData["childName"] = $value;
                 }
                 if ($fieldId === AMO_CONTACT_FIELD_CHILD_BIRTHDATE && $value !== null) {
-                    $contactData["childBirthDate"] = $value;
+                    $normalizedChildBirthDate = normalizeOkiDateForAmo((string)$value);
+                    $contactData["childBirthDate"] = $normalizedChildBirthDate !== '' ? $normalizedChildBirthDate : $value;
                 }
             }
         }
 
-        $studentNameSource = $contactData["childName"] ?? $contactName;
+        $hasSeparateChild = !empty($contactData["childName"]);
+        $studentNameSource = $hasSeparateChild ? $contactData["childName"] : $contactName;
         $nameParts = preg_split('/\s+/u', trim((string) $studentNameSource)) ?: [];
 
         if (!empty($nameParts[0])) {
@@ -890,10 +1158,15 @@ function extractContactData(int $contactId): array
             $contactData["birthDate"] = $contactData["childBirthDate"];
         }
 
-        if (!empty($contactData["childName"]) && $contactName !== '') {
+        if ($hasSeparateChild && $contactName !== '') {
             $contactData["parentName"] = $contactName;
+            if (!empty($contactData["phone"])) {
+                $contactData["parentPhone"] = $contactData["phone"];
+                unset($contactData["phone"]);
+            }
             if (!empty($contactData["email"])) {
                 $contactData["parentEmail"] = $contactData["email"];
+                unset($contactData["email"]);
             }
         }
 
@@ -995,6 +1268,11 @@ function processHollyhopResponse(array $response, int $leadId, array $lead): voi
             'response' => $response,
             'lead_id'  => $leadId
         ], 'index.php');
+    } elseif (isSameProfileLink($lead, $profileLink)) {
+        log_info("Ссылка на профиль уже актуальна, PATCH в AmoCRM не требуется", [
+            'lead_id' => $leadId,
+            'link' => $profileLink
+        ], 'index.php');
     } else {
         log_info("Ссылка на профиль студента получена", [
             'link'    => $profileLink,
@@ -1056,6 +1334,24 @@ function updateLeadProfileLink(int $leadId, string $profileLink): void
             echo "Ошибка обновления: " . $e->getMessage();
         }
     }
+}
+
+function isSameProfileLink(array $lead, string $profileLink): bool
+{
+    foreach ($lead["custom_fields_values"] ?? [] as $field) {
+        if (($field["field_id"] ?? null) !== AMO_FIELD_PROFILE_LINK) {
+            continue;
+        }
+
+        $currentLink = trim((string) ($field["values"][0]["value"] ?? ''));
+        if ($currentLink === '') {
+            return false;
+        }
+
+        return normalizeUrl($currentLink) === normalizeUrl($profileLink);
+    }
+
+    return false;
 }
 
 function extractContractLinkFromLead(array $lead): ?string
@@ -1166,12 +1462,18 @@ function updateHollyhopAmoDeal(int $clientId, int $leadId, array $lead): void
         }
 
         $allExtraFields = extractAllExtraFields($student, $amoDealLink);
+        $studentData = buildStudentDataFromLead($lead, $leadId);
+
+        foreach (buildHollyExtraFieldsFromStudentData($studentData) as $extraField) {
+            upsertHollyhopExtraField(
+                $allExtraFields,
+                $extraField['name'],
+                $extraField['value']
+            );
+        }
 
         if (!empty($contractLink)) {
-            $allExtraFields[] = [
-                'name'  => 'Договор Оки',
-                'value' => $contractLink
-            ];
+            upsertHollyhopExtraField($allExtraFields, 'Договор Оки', $contractLink);
             log_info("Добавляем поле Договор Оки", [
                 'clientId'      => $clientId,
                 'contract_link' => $contractLink
@@ -1187,6 +1489,83 @@ function updateHollyhopAmoDeal(int $clientId, int $leadId, array $lead): void
             'lead_id'  => $leadId
         ], 'index.php');
     }
+}
+
+function buildHollyExtraFieldsFromStudentData(array $studentData): array
+{
+    $mapping = [
+        'hollyPackage'          => 'Пакет (индив)',
+        'hollyLessonsCount'     => 'Количество уроков (индив)',
+        'hollyPackageTerm'      => 'Срок пакета (индив)',
+        'hollyIntensity'        => 'Интенсивность (индив)',
+        'hollyLessonDuration'   => 'Длительность урока (индив)',
+        'hollyLessonLocation'   => 'Место проведения (индив)',
+        'hollyTeacher'          => 'Преподаватель (индив)',
+        'hollySlotFixed'        => 'Фиксация слота (индив)',
+        'hollySchedule'         => 'Слот день+время (индив)',
+        'hollyDiscount'         => 'Скидка (индив)',
+        'hollyVip'              => 'VIP (индив)',
+        'hollyLessonPrice'      => 'Цена 1 занятия (индив)',
+        'hollyTotalPrice'       => 'Итого стоимость со скидкой (индив)',
+        'hollyComboActive'      => 'Комбо Актив (индив)',
+        'hollyLanguageClub'     => 'Языковой клуб (индив)',
+        'hollyTransferLimit'    => 'Лимит переносов (индив)',
+        'hollyFreePause'        => 'Пауза / недель (индив)',
+        'hollySecondPaymentDue' => 'Срок оплаты 50/50 (вторая часть) индив',
+    ];
+
+    $fields = [];
+    foreach ($mapping as $dataKey => $fieldName) {
+        if (!array_key_exists($dataKey, $studentData)) {
+            continue;
+        }
+
+        $value = trim((string) $studentData[$dataKey]);
+        if ($dataKey === 'hollySecondPaymentDue') {
+            $value = normalizeHollyCustomDateValue($value);
+        }
+        if ($value === '') {
+            continue;
+        }
+
+        $fields[] = [
+            'name'  => $fieldName,
+            'value' => $value,
+        ];
+    }
+
+    return $fields;
+}
+
+function upsertHollyhopExtraField(array &$fields, string $fieldName, string $fieldValue): void
+{
+    $normalizedTarget = normalizeHollyhopExtraFieldName($fieldName);
+
+    foreach ($fields as &$field) {
+        $currentName = (string) ($field['name'] ?? '');
+        if (normalizeHollyhopExtraFieldName($currentName) !== $normalizedTarget) {
+            continue;
+        }
+
+        $field['name'] = $fieldName;
+        $field['value'] = $fieldValue;
+        return;
+    }
+    unset($field);
+
+    $fields[] = [
+        'name' => $fieldName,
+        'value' => $fieldValue
+    ];
+}
+
+function normalizeHollyhopExtraFieldName(string $fieldName): string
+{
+    $normalized = trim($fieldName);
+    $normalized = str_replace('ё', 'е', $normalized);
+    $normalized = preg_replace('/\s+/u', ' ', $normalized);
+
+    return mb_strtolower($normalized, 'UTF-8');
 }
 
 function getManagerNameFromLead(array $lead): string

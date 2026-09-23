@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram update polling for topic discovery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/telegram-polling.env
+WorkingDirectory=/opt/telegram-polling
+ExecStart=/usr/bin/env bash /opt/telegram-polling/telegram_polling.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

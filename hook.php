@@ -2,6 +2,16 @@
 
 require_once __DIR__.'/amo_func.php';
 
+$oauth_token = trim((string)($_GET['code'] ?? $_POST['code'] ?? ''));
+if ($oauth_token === '') {
+    http_response_code(400);
+    exit('Не передан OAuth code.');
+}
+
+if ($client_id === '' || $client_secret === '' || $redirect_uri === '' || $subdomain === '') {
+    die('Ошибка конфигурации AmoCRM: проверьте AMOCRM_CLIENT_ID, AMOCRM_CLIENT_SECRET, AMOCRM_REDIRECT_URI и AMOCRM_SUBDOMAIN в .env');
+}
+
 $link = 'https://' . $subdomain . '.amocrm.ru/oauth2/access_token'; //Формируем URL для запроса
 
 /** Соберем данные для запроса */

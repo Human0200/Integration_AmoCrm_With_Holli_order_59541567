@@ -8,7 +8,7 @@ require_once __DIR__ . '/amo_func.php';
 
 const COORDINATORS_SOURCE = 'amo_coordinators_hook.php';
 const SOURCE_AMO_BASE_URL = 'https://supportchinatutorru.amocrm.ru';
-const SOURCE_AMO_ACCESS_TOKEN = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImp0aSI6ImYwMGQzMjI3ZTkxMzdlODI1MDAzM2MwNjdhMTc2ODUzZGVmYjQ1ODlkNjZlYTA1Zjc4NWJjNjAxOTIxNGQzM2Y2OTgwMzdkOTBmNGJkYzdmIn0.eyJhdWQiOiIwNTQ0ZDY3NC00MmI4LTRiYTMtOTBlZC02OTM4MGFkMzNjNWQiLCJqdGkiOiJmMDBkMzIyN2U5MTM3ZTgyNTAwMzNjMDY3YTE3Njg1M2RlZmI0NTg5ZDY2ZWEwNWY3ODViYzYwMTkyMTRkMzNmNjk4MDM3ZDkwZjRiZGM3ZiIsImlhdCI6MTc4Mjc1MDc1MSwibmJmIjoxNzgyNzUwNzUxLCJleHAiOjE4MzI5NzYwMDAsInN1YiI6IjEyNjQyMzE0IiwiZ3JhbnRfdHlwZSI6IiIsImFjY291bnRfaWQiOjMyNDk1NjI2LCJiYXNlX2RvbWFpbiI6ImFtb2NybS5ydSIsInZlcnNpb24iOjIsInNjb3BlcyI6WyJwdXNoX25vdGlmaWNhdGlvbnMiLCJmaWxlcyIsImNybSIsImZpbGVzX2RlbGV0ZSIsIm5vdGlmaWNhdGlvbnMiXSwiaGFzaF91dWlkIjoiZTJiNDgyOGQtYTU2MC00MWU5LWJlODUtMTY4MjlkY2U4ODJjIiwiYXBpX2RvbWFpbiI6ImFwaS1iLmFtb2NybS5ydSJ9.UiHjJ8lp241msyrMtyMNTK4z033Lz7nXNCNnK-TdycHGdy40FvGiQyVZplxvJiITnU6VvU0GSDaW6BsigRSbR2cvgFF4_5HMLXJe4wMOp7FxaLrYrL6S8fLZSEmCqbLs6XjPU9PyhDauOBum2xWtxNYA8fwr4ZayeEAGn-raGWxeURkSqONr7tx4BOOon7d2AZxwLwcYcBOvF7kevrk79EnfnrvEDh3wGr0GdLPWVqJm4iICDWbUv2YaMwyzHDEZSN3qUfVfHa5Z8M--_RtRaWLM-HCckwgYYqt7-rbcpo6Gunmlibtj2efv02BQAPNCRw-zODCFgIBKPr_vspdWwg';
+const SOURCE_AMO_ACCESS_TOKEN = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImp0aSI6ImVmMjg5ODQ2YTBlZmE4MTEyYTgwYTUyZTcyOTU5M2FjM2NlMWFlMzE2ZmQ4ZTZlZDNkMjE0YjkxN2JmZmRlNmI4ZGRhZDYxNzQ1MmVhZDE5In0.eyJhdWQiOiIwNTQ0ZDY3NC00MmI4LTRiYTMtOTBlZC02OTM4MGFkMzNjNWQiLCJqdGkiOiJlZjI4OTg0NmEwZWZhODExMmE4MGE1MmU3Mjk1OTNhYzNjZTFhZTMxNmZkOGU2ZWQzZDIxNGI5MTdiZmZkZTZiOGRkYWQ2MTc0NTJlYWQxOSIsImlhdCI6MTc4NjE4NzMxNSwibmJmIjoxNzg2MTg3MzE1LCJleHAiOjE4NDYwMjI0MDAsInN1YiI6IjEyNjQyMzE0IiwiZ3JhbnRfdHlwZSI6IiIsImFjY291bnRfaWQiOjMyNDk1NjI2LCJiYXNlX2RvbWFpbiI6ImFtb2NybS5ydSIsInZlcnNpb24iOjIsInNjb3BlcyI6WyJwdXNoX25vdGlmaWNhdGlvbnMiLCJmaWxlcyIsImNybSIsImZpbGVzX2RlbGV0ZSIsIm5vdGlmaWNhdGlvbnMiXSwiaGFzaF91dWlkIjoiZGJkZGMwNjItOTAxYS00NjA0LTk3YTItYzc3OWRlMDZkYTZkIiwiYXBpX2RvbWFpbiI6ImFwaS1iLmFtb2NybS5ydSJ9.MdFT-9mnH3NzHqNeeiwLtaLLFBcx2bbz3S6wks7o43SHg1jCcI10DbwzCgVMfjtCOs666MIKPrQXcFFijzKfGI3AwuOK-3tOQafk-f9mLqy-3IqTjhFcnr-vaHSrqg1l6XmVi5W933YpTrWP7ocB-DVXHuzcG8GxuSdRP4VJfQEW0ZijGxX8x1OhPy7Nu_-9QmGqSObCoGHVXjNSJ-uxlO9anBJuNwCNj_meoa4mbRppUo6S0c-mi7ZPy-ab60UPJC3n3QTuuYXWMK3AuX7L-dIKH-i3TRhj9d9WFQiYBOTLTsZCEQzfMWTx8KzcnfjIlxhUIBI-6fK5CYGUi9Fwpg';
 
 // Стандартные поля контакта amoCRM supportchinatutorru.
 const AMO_CONTACT_FIELD_PHONE = 1050073;
@@ -548,7 +548,7 @@ function createCoordinatorLead(array $studentData, array $routing): array
         $lead['_embedded'] = ['contacts' => $contacts];
     }
 
-    $response = coordinatorAmoRequest('/api/v4/leads/complex', [$lead], 'POST');
+    $response = coordinatorAmoRequestWithFieldRetry('/api/v4/leads/complex', $lead, 'POST');
     if (!is_array($response) || !isset($response[0]) || !is_array($response[0])) {
         throw new RuntimeException('Некорректный ответ AmoCRM при создании lead/contacts.');
     }
@@ -560,7 +560,55 @@ function updateCoordinatorLead(int $leadId, array $studentData, array $routing):
 {
     $lead = buildCoordinatorLeadPayload($studentData, $routing);
     $lead['id'] = $leadId;
-    coordinatorAmoRequest('/api/v4/leads', [$lead], 'PATCH');
+    coordinatorAmoRequestWithFieldRetry('/api/v4/leads', $lead, 'PATCH');
+}
+
+/**
+ * Отправляет сделку в amoCRM; при HTTP 400 NotSupportedChoice (значение поля
+ * отсутствует в enum, например "Формат обучения") отклоненное поле сделки
+ * выбрасывается и запрос повторяется — сделка не должна теряться целиком
+ * из-за одного невалидного значения.
+ */
+function coordinatorAmoRequestWithFieldRetry(string $path, array $lead, string $method, int $maxDrops = 5): array
+{
+    $attempt = 0;
+
+    while (true) {
+        try {
+            return coordinatorAmoRequest($path, [$lead], $method);
+        } catch (Throwable $e) {
+            $dropIndex = extractRejectedLeadFieldIndex($e->getMessage());
+            $fields = $lead['custom_fields_values'] ?? [];
+
+            if ($dropIndex === null || !isset($fields[$dropIndex]) || $attempt >= $maxDrops) {
+                throw $e;
+            }
+
+            coordinator_log_warning('AmoCRM отклонил значение кастомного поля сделки, повтор запроса без него', [
+                'field_id'    => $fields[$dropIndex]['field_id'] ?? 0,
+                'field_index' => $dropIndex,
+                'amo_error'   => mb_substr($e->getMessage(), 0, 300, 'UTF-8'),
+            ]);
+
+            unset($fields[$dropIndex]);
+            $lead['custom_fields_values'] = array_values($fields);
+            $attempt++;
+        }
+    }
+}
+
+/**
+ * Извлекает индекс поля сделки из ответа amoCRM с validation-errors.
+ * Учитываются только пути самой сделки ("custom_fields_values.N..."),
+ * пути контактов ("_embedded.contacts.N.custom_fields_values...") игнорируются.
+ */
+function extractRejectedLeadFieldIndex(string $errorMessage): ?int
+{
+    if (!preg_match('/"path"\s*:\s*"custom_fields_values\.(\d+)(?:\.|")/', $errorMessage, $matches)) {
+        return null;
+    }
+
+    return (int) $matches[1];
 }
 
 function coordinatorAmoRequest(string $path, array $payload, string $method): array
@@ -836,10 +884,27 @@ function updateHollyAmoOsField(array $student, array $studentData, string $amoLe
         ];
     }
 
-    callHollyhopApiForCoordinators('EditUserExtraFields', [
+    $params = [
         'studentClientId' => $studentData['studentClientId'],
         'fields' => $fields
-    ]);
+    ];
+
+    try {
+        callHollyhopApiForCoordinators('EditUserExtraFields', $params);
+    } catch (Throwable $e) {
+        // Запись ссылки в Hollyhop не должна ронять обработку вебхука:
+        // сделка amo ОС уже создана/обновлена, а Hollyhop получает success
+        // и не ретраит вебхук (иначе плодятся дубли).
+        // Частая причина: поле "АМО (ОС)" не существует в Hollyhop
+        // (EditUserExtraFields не создает поля) — его нужно создать вручную
+        // или указать его Id в HOLLY_FIELD_AMO_OS.
+        coordinator_log_warning('Не удалось обновить поле "АМО (ОС)" в Hollyhop', [
+            'student_client_id' => $studentData['studentClientId'],
+            'amo_lead_url'      => $amoLeadUrl,
+            'field_names'       => array_map(static fn ($f) => $f['name'] ?? '', $fields),
+            'error'             => $e->getMessage(),
+        ]);
+    }
 }
 
 function normalizeAmoLearningType(string $value): array
@@ -1195,7 +1260,18 @@ function buildFullNameFromParts($lastName, $firstName, $middleName): string
 function normalizeFieldName(string $value): string
 {
     $value = str_replace('ё', 'е', mb_strtolower(trim($value), 'UTF-8'));
-    return preg_replace('/\s+/u', ' ', $value) ?? $value;
+
+    // Кириллические и латинские гомоглифы должны совпадать:
+    // поле "АМО (ОС)" и "AMO (OC)" — это одно и то же поле Hollyhop.
+    $homoglyphs = [
+        'а' => 'a', 'в' => 'b', 'е' => 'e', 'к' => 'k', 'м' => 'm',
+        'н' => 'h', 'о' => 'o', 'р' => 'p', 'с' => 'c', 'т' => 't',
+        'у' => 'y', 'х' => 'x',
+    ];
+    $value = strtr($value, $homoglyphs);
+
+    // Пробелы не влияют на идентификацию поля: "АМО (ОС)" === "АМО(ОС)".
+    return preg_replace('/\s+/u', '', $value) ?? $value;
 }
 
 function normalizeDateValue(string $value): string
@@ -1307,4 +1383,9 @@ function coordinator_log_info(string $message, $data = null): void
 function coordinator_log_error(string $message, $data = null): void
 {
     coordinator_log('ERROR', $message, $data);
+}
+
+function coordinator_log_warning(string $message, $data = null): void
+{
+    coordinator_log('WARNING', $message, $data);
 }

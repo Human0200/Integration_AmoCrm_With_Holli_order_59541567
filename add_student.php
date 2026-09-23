@@ -218,6 +218,16 @@ function normalize_holly_custom_date($value)
     return $value;
 }
 
+function normalize_holly_email($value): string
+{
+    $email = trim((string) $value);
+    if ($email === '' || $email === '.') {
+        return '';
+    }
+
+    return $email;
+}
+
 function build_student_extra_fields_from_post_data($post_data)
 {
     $extra_fields = [];
@@ -316,7 +326,7 @@ function build_agent_contacts_payload($student_info, $post_data, $client_id)
 {
     $parent_name = trim((string)($post_data['parentName'] ?? ''));
     $parent_phone = trim((string)($post_data['parentPhone'] ?? ''));
-    $parent_email = trim((string)($post_data['parentEmail'] ?? ''));
+    $parent_email = normalize_holly_email($post_data['parentEmail'] ?? '');
     $emergency_phone = trim((string)($post_data['parentEmergencyPhone'] ?? ''));
 
     if ($parent_name === '' && $parent_phone === '' && $parent_email === '' && $emergency_phone === '') {
@@ -531,6 +541,15 @@ try {
         'data_keys' => is_array($post_data) ? array_keys($post_data) : 'not_array',
         'data_preview' => is_array($post_data) ? json_encode($post_data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) : (string)$post_data
     ], 'INFO');
+
+    if (is_array($post_data)) {
+        if (array_key_exists('email', $post_data)) {
+            $post_data['email'] = normalize_holly_email($post_data['email']);
+        }
+        if (array_key_exists('parentEmail', $post_data)) {
+            $post_data['parentEmail'] = normalize_holly_email($post_data['parentEmail']);
+        }
+    }
 
     // Валидируем данные
     log_message("ШАГ 2: Валидация входных данных", [], 'INFO');
@@ -1305,7 +1324,7 @@ if (!empty($post_data['officeOrCompanyId'])) {
     ], 'INFO');
 
     $student_contact_phone = trim((string)($post_data['phone'] ?? $post_data['parentPhone'] ?? ''));
-    $student_contact_email = trim((string)($post_data['email'] ?? $post_data['parentEmail'] ?? ''));
+    $student_contact_email = normalize_holly_email($post_data['email'] ?? $post_data['parentEmail'] ?? '');
 
     if ($client_id && (
         $student_contact_phone !== ''

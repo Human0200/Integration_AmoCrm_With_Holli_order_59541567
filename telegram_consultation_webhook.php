@@ -11,8 +11,10 @@ const TELEGRAM_CONSULTATION_PIPELINE_ID = 8117846;
 const TELEGRAM_API_IP = '149.154.167.220';
 
 $source = 'telegram_consultation_webhook.php';
-$botToken = trim((string) (getenv('TELEGRAM_BOT_TOKEN') ?: ''));
-$chatId = trim((string) (getenv('TELEGRAM_CONSULTATION_CHAT_ID') ?: '753744248'));
+$relayUrl = trim((string) (getenv('TELEGRAM_RELAY_URL') ?: ''));
+$relaySecret = trim((string) (getenv('TELEGRAM_RELAY_SECRET') ?: ''));
+$chatId = trim((string) (getenv('TELEGRAM_CONSULTATION_CHAT_ID') ?: '-1003492856244'));
+$messageThreadId = extractPositiveInt(getenv('TELEGRAM_CONSULTATION_THREAD_ID'));
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -22,7 +24,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit;
 }
 
-if ($botToken === '') {
+if ($relayUrl === '' || $relaySecret === '') {
     http_response_code(500);
     log_error('Не задан TELEGRAM_BOT_TOKEN', null, $source);
     echo json_encode(['success' => false, 'error' => 'Telegram bot is not configured.']);
@@ -69,13 +71,15 @@ try {
         . "Сделка: " . $leadName . "\n"
         . "amoCRM: " . $amoLink;
 
-    $telegramResponse = sendTelegramMessage($botToken, $chatId, $message);
+    $telegramResponse = sendTelegramMessage($relayUrl, $relaySecret, $chatId, $message, $messageThreadId);
     @mkdir(dirname($stateFile), 0755, true);
     @file_put_contents($stateFile, $eventKey, LOCK_EX);
 
     log_info('Напоминание о консультации отправлено в Telegram', [
         'lead_id' => $leadId,
         'consultation_at' => $date->format(DateTimeInterface::ATOM),
+        'chat_id' => $chatId,
+        'message_thread_id' => $messageThreadId,
         'telegram_message_id' => $telegramResponse['result']['message_id'] ?? null,
     ], $source);
     respondOk('Напоминание отправлено.');
@@ -120,25 +124,43 @@ function extractDateTimeField(array $lead, int $fieldId): ?int
     return null;
 }
 
-function sendTelegramMessage(string $botToken, string $chatId, string $message): array
+function extractPositiveInt($value): ?int
 {
-    $ch = curl_init('https://api.telegram.org/bot' . rawurlencode($botToken) . '/sendMessage');
+    if ($value === false || $value === null) {
+        return null;
+    }
+
+    $value = trim((string) $value);
+    if ($value === '' || !preg_match('/^\d+$/', $value)) {
+        return null;
+    }
+
+    $intValue = (int) $value;
+    return $intValue > 0 ? $intValue : null;
+}
+
+function sendTelegramMessage(string $relayUrl, string $relaySecret, string $chatId, string $message, ?int $messageThreadId = null): array
+{
+    $payload = [
+        'chat_id' => $chatId,
+        'text' => $message,
+        'disable_web_page_preview' => true,
+    ];
+    if ($messageThreadId !== null) {
+        $payload['message_thread_id'] = $messageThreadId;
+    }
+
+    $ch = curl_init($relayUrl);
     curl_setopt_array($ch, [
         CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => http_build_query([
-            'chat_id' => $chatId,
-            'text' => $message,
-            'disable_web_page_preview' => 'true',
-        ]),
-        CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
+        CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $relaySecret,
+        ],
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_TIMEOUT => 20,
-        CURLOPT_NOPROXY => '*',
-        CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
-        // The host's DNS route to Telegram times out, while the API IP is reachable.
-        // CURLOPT_RESOLVE retains api.telegram.org for TLS/SNI and certificate validation.
-        CURLOPT_RESOLVE => ['api.telegram.org:443:' . TELEGRAM_API_IP],
         CURLOPT_SSL_VERIFYPEER => true,
     ]);
 

@@ -65,10 +65,52 @@ try {
 
 // Получаем параметры конфигурации
 $config = [
+    'amocrm' => [
+        'client_id' => getenv('AMOCRM_CLIENT_ID') ?: 'e2776d4925914663886c992d8e29fc5b',
+        'client_secret' => getenv('AMOCRM_CLIENT_SECRET') ?: '6abacd33ad3143f7a8cde57e2b849c1a',
+        'redirect_uri' => getenv('AMOCRM_REDIRECT_URI') ?: 'https://srm.chinatutor.ru/hook.php',
+        'subdomain' => getenv('AMOCRM_SUBDOMAIN') ?: 'directorchinatutorru',
+    ],
     'api' => [
         'subdomain' => getenv('HOLLYHOP_SUBDOMAIN') ?: 'your_subdomain',
         'auth_key' => getenv('HOLLYHOP_AUTH_KEY') ?: 'your_auth_key',
         'base_url' => 'https://' . (getenv('HOLLYHOP_SUBDOMAIN') ?: 'your_subdomain') . '.t8s.ru/Api/V2'
+    ],
+    'yandex_forms' => [
+        'api_base_url' => getenv('YANDEX_FORMS_API_BASE_URL') ?: 'https://api.forms.yandex.net/v1',
+        'token' => getenv('YANDEX_FORMS_TOKEN') ?: 'y0__wgBEILGv6Sq94ACGNzcRiDIoqTGGFfZfp2LqpV7YFtMbeBh3m0kVWzT',
+        'org_id' => getenv('YANDEX_FORMS_ORG_ID') ?: '',
+        'lead_param_name' => getenv('YANDEX_FORMS_LEAD_PARAM_NAME') ?: 'amo_lead_id',
+        'portal_param_name' => getenv('YANDEX_FORMS_PORTAL_PARAM_NAME') ?: 'amo_portal',
+        'public_base_url' => rtrim(getenv('YANDEX_FORMS_PUBLIC_BASE_URL') ?: 'https://srm.chinatutor.ru', '/'),
+        'results_field_id' => 1639409,
+        'secondary_results_field_id' => 1902565,
+        'task_enabled' => true,
+        'task_text' => 'Проверить ответ Яндекс.Формы',
+        'task_due_hours' => 24,
+        'widget_server_url' => rtrim(getenv('YANDEX_FORMS_WIDGET_SERVER_URL') ?: 'https://srm.chinatutor.ru/yandex_forms_api.php', '/'),
+        'storage_dir' => __DIR__ . '/data/yandex_forms',
+    ],
+    'amocrm_portals' => [
+        'directorchinatutorru' => [
+            'client_id' => getenv('AMOCRM_CLIENT_ID') ?: 'e2776d4925914663886c992d8e29fc5b',
+            'client_secret' => getenv('AMOCRM_CLIENT_SECRET') ?: '6abacd33ad3143f7a8cde57e2b849c1a',
+            'redirect_uri' => getenv('AMOCRM_REDIRECT_URI') ?: 'https://srm.chinatutor.ru/hook.php',
+            'subdomain' => getenv('AMOCRM_SUBDOMAIN') ?: 'directorchinatutorru',
+            'tokens_file' => getenv('AMOCRM_TOKENS_FILE') ?: (__DIR__ . '/tokens.json'),
+            'results_field_id' => 1639409,
+            'results_history_field_id' => 1640135,
+        ],
+        'secondary' => [
+            'client_id' => getenv('AMOCRM_SECONDARY_CLIENT_ID') ?: '',
+            'client_secret' => getenv('AMOCRM_SECONDARY_CLIENT_SECRET') ?: '',
+            'redirect_uri' => getenv('AMOCRM_SECONDARY_REDIRECT_URI') ?: '',
+            'subdomain' => getenv('AMOCRM_SECONDARY_SUBDOMAIN') ?: 'supportchinatutorru',
+            'tokens_file' => getenv('AMOCRM_SECONDARY_TOKENS_FILE') ?: (__DIR__ . '/tokens_secondary.json'),
+            'access_token' => getenv('AMOCRM_SECONDARY_ACCESS_TOKEN') ?: 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImp0aSI6ImM2MDc4MDY1ZTczN2IwOWU1MTcxMDY5ZjUzZmIyN2QwNzBjMTA3YzIyODI0NzAxNzAzNjdhZGI2NzlhM2MwOWEyNzM1NGI5ZDk5ZjE1ZDMzIn0.eyJhdWQiOiIwNTQ0ZDY3NC00MmI4LTRiYTMtOTBlZC02OTM4MGFkMzNjNWQiLCJqdGkiOiJjNjA3ODA2NWU3MzdiMDllNTE3MTA2OWY1M2ZiMjdkMDcwYzEwN2MyMjgyNDcwMTcwMzY3YWRiNjc5YTNjMDlhMjczNTRiOWQ5OWYxNWQzMyIsImlhdCI6MTc3NTY2NDY0NSwibmJmIjoxNzc1NjY0NjQ1LCJleHAiOjE3ODAxODU2MDAsInN1YiI6IjEyNjQyMzE0IiwiZ3JhbnRfdHlwZSI6IiIsImFjY291bnRfaWQiOjMyNDk1NjI2LCJiYXNlX2RvbWFpbiI6ImFtb2NybS5ydSIsInZlcnNpb24iOjIsInNjb3BlcyI6WyJwdXNoX25vdGlmaWNhdGlvbnMiLCJmaWxlcyIsImNybSIsImZpbGVzX2RlbGV0ZSIsIm5vdGlmaWNhdGlvbnMiXSwiaGFzaF91dWlkIjoiMGFiYmNhYWUtYzUzNi00NzMwLWEyODAtNDdjNjAwMjBkMGJmIiwiYXBpX2RvbWFpbiI6ImFwaS1iLmFtb2NybS5ydSJ9.GWXm7Z4v0eXQcb9w3SrlTdeY31GGzJf4Ta7EZZune6O61j520bu-rQKyLeUhJNjZz4tPDLBbf7l5_P-60QGAg_aW-JwCwExpMb04_0FLZIl4GcclB_dnT9zoccvsrXe58bNl50du4hiAhan58GWb51K9zM0BI8A0cOB9Hasytno1dJ_eLF9euyYlP5d_yRqV-5TsryUCg6PDwQaKgfZsjOh-bHY60vog6NHuM5u66BN6l_4XI44tTARWYDySRx9UpwnsQLkCgDUfPKHE9ij4D92-hJJSkUubn9jygblVasxoOz0oCH65Rx38Jo2wHuZ21RjgGXOp-Dwb5gBOW3zoxA',
+            'results_field_id' => 1902565,
+            'results_history_field_id' => 1908251,
+        ],
     ],
     'upload' => [
         'max_photo_size' => (int)(getenv('MAX_PHOTO_SIZE') ?: 5242880), // 5MB

@@ -1,6 +1,76 @@
 <?php
 require_once('./logger.php');
 require_once('./amo_func.php');
+require_once __DIR__ . '/zoom_salesbot_reminders.php';
+
+// Любой входящий webhook является тиком планировщика просроченных агентов.
+// Запуск идемпотентный: JSON-агент блокируется и после успеха получает статус sent.
+try {
+    $agentResult = zoom_salesbot_run_agents();
+    if (($agentResult['sent'] ?? 0) > 0 || ($agentResult['errors'] ?? 0) > 0) {
+        log_message('INFO: Агенты Zoom обработаны в sourceHook', $agentResult, 'sourceHook.php');
+    }
+} catch (Throwable $exception) {
+    log_message('ERROR: Ошибка запуска агентов Zoom в sourceHook', ['error' => $exception->getMessage()], 'sourceHook.php');
+}
+
+$amoWorkerMode = null;
+$amoWorkerPayloadFile = null;
+if (PHP_SAPI === 'cli' && isset($argv) && is_array($argv)) {
+    foreach ($argv as $argument) {
+        if (str_starts_with($argument, '--amo-worker=')) {
+            $amoWorkerMode = substr($argument, strlen('--amo-worker='));
+        }
+        if (str_starts_with($argument, '--amo-payload=')) {
+            $amoWorkerPayloadFile = substr($argument, strlen('--amo-payload='));
+        }
+    }
+
+    if ($amoWorkerPayloadFile !== null && is_file($amoWorkerPayloadFile)) {
+        $workerPayload = json_decode((string) file_get_contents($amoWorkerPayloadFile), true);
+        if (is_array($workerPayload)) {
+            $_POST = $workerPayload;
+        }
+        @unlink($amoWorkerPayloadFile);
+    }
+}
+
+function forward_update_webhook_to_index(array $webhook_data, int $leadId, string $reason): void
+{
+    $targetUrl = 'https://srm.chinatutor.ru/index.php';
+    $postBody = http_build_query($webhook_data);
+
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $targetUrl);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $postBody);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/x-www-form-urlencoded'
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError !== '') {
+        log_message('ERROR: Не удалось пробросить update webhook в index.php', [
+            'lead_id' => $leadId,
+            'reason' => $reason,
+            'curl_error' => $curlError,
+        ], 'sourceHook.php');
+        return;
+    }
+
+    log_message('INFO: Update webhook проброшен в index.php', [
+        'lead_id' => $leadId,
+        'reason' => $reason,
+        'http_code' => $httpCode,
+        'response_preview' => mb_substr((string) $response, 0, 500),
+    ], 'sourceHook.php');
+}
 
 // --- Конфигурация ---
 $salebot_api_key = '35fa1d3f223b1be010e3f95bf0fc5e44';
@@ -30,12 +100,9 @@ $client_type_map = [
 // ДАННЫЕ ПРИХОДЯТ В $_POST
 $webhook_data = $_POST;
 
-log_message('DATA: ', $webhook_data, 'sourceHook.php');
-
 if (empty($webhook_data)) {
-    log_message('ERROR: Пустой $_POST', [], 'sourceHook.php');
-    http_response_code(200);
-    echo "OK - empty POST";
+    log_message('INFO: sourceHook получен без данных, пропускаем', [], 'sourceHook.php');
+    acknowledgeAmoWebhook();
     exit;
 }
 
@@ -47,11 +114,31 @@ if (isset($webhook_data["leads"]["update"][0]["id"])) {
 }
 
 if (!$leadId) {
-    log_message('ERROR: Не удалось определить lead_id', $webhook_data, 'sourceHook.php');
-    http_response_code(200);
-    echo "OK - no lead ID";
+    log_message('INFO: sourceHook без lead_id, пропускаем', [
+        'keys' => array_keys($webhook_data),
+    ], 'sourceHook.php');
+    acknowledgeAmoWebhook();
     exit;
 }
+
+log_message('INFO: sourceHook получен', [
+    'lead_id' => $leadId,
+    'has_name' => isset($webhook_data["leads"]["update"][0]["name"]),
+    'event_keys' => isset($webhook_data['leads']) && is_array($webhook_data['leads']) ? array_keys($webhook_data['leads']) : [],
+], 'sourceHook.php');
+
+if (!claimWebhookCooldown($leadId, 30)) {
+    acknowledgeAmoWebhook();
+    exit;
+}
+
+if ($amoWorkerMode === null) {
+    log_message('INFO: sourceHook будет обработан в текущем процессе после быстрого ответа', [
+        'lead_id' => $leadId,
+    ], 'sourceHook.php');
+}
+
+acknowledgeAmoWebhook();
 
 // Получаем название сделки
 $lead_name = $webhook_data["leads"]["update"][0]["name"] ?? '';
@@ -61,8 +148,7 @@ preg_match('/№(\d+)/', $lead_name, $matches);
 
 if (empty($matches)) {
     log_message('ERROR: Не удалось найти client_id в названии сделки: ' . $lead_name, [], 'sourceHook.php');
-    http_response_code(200);
-    echo "OK - no client_id found";
+    forward_update_webhook_to_index($webhook_data, $leadId, 'client_id_not_found');
     exit;
 }
 
@@ -110,8 +196,7 @@ $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 if (curl_error($ch)) {
     log_message('ERROR: Ошибка cURL при запросе к Salebot: ' . curl_error($ch), [], 'sourceHook.php');
     curl_close($ch);
-    http_response_code(200);
-    echo "OK - curl error";
+    forward_update_webhook_to_index($webhook_data, $leadId, 'salebot_curl_error');
     exit;
 }
 
@@ -120,8 +205,7 @@ curl_close($ch);
 
 if ($http_code != 200) {
     log_message('ERROR: Salebot вернул ошибку HTTP ' . $http_code, [], 'sourceHook.php');
-    http_response_code(200);
-    echo "OK - salebot error";
+    forward_update_webhook_to_index($webhook_data, $leadId, 'salebot_http_error');
     exit;
 }
 
@@ -130,8 +214,7 @@ $salebot_data = json_decode($salebot_response, true);
 
 if (!$salebot_data) {
     log_message('ERROR: Не удалось декодировать ответ Salebot', ['response' => $salebot_response], 'sourceHook.php');
-    http_response_code(200);
-    echo "OK - invalid salebot response";
+    forward_update_webhook_to_index($webhook_data, $leadId, 'salebot_invalid_json');
     exit;
 }
 
@@ -163,8 +246,7 @@ if (!$new_enum_id) {
 
 // --- ПРОВЕРЯЕМ, НУЖНО ЛИ ОБНОВЛЯТЬ ---
 if ($current_enum_id === $new_enum_id) {
-    http_response_code(200);
-    echo "OK - no update needed";
+    forward_update_webhook_to_index($webhook_data, $leadId, 'channel_already_actual');
     exit;
 }
 
@@ -193,15 +275,58 @@ try {
         'PATCH'
     );
     
-    log_message('SUCCESS: Поле "Канал" обновлено', ['result' => $result], 'sourceHook.php');
+    log_message('SUCCESS: Поле "Канал" обновлено', [
+        'lead_id' => $leadId,
+        'enum_id' => $new_enum_id,
+    ], 'sourceHook.php');
     
 } catch (Exception $e) {
     log_message('ERROR: Ошибка при обновлении', [
         'error' => $e->getMessage(),
         'lead_id' => $leadId
     ], 'sourceHook.php');
+    forward_update_webhook_to_index($webhook_data, $leadId, 'channel_update_failed');
 }
 
-http_response_code(200);
-echo "OK - completed";
+function acknowledgeAmoWebhook(): void
+{
+    http_response_code(200);
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Connection: close');
+    echo "OK";
+
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+        return;
+    }
+
+    if (ob_get_level() > 0) {
+        ob_end_flush();
+    }
+    flush();
+}
+
+function claimWebhookCooldown(int $leadId, int $seconds): bool
+{
+    $lockDir = __DIR__ . '/locks';
+    if (!is_dir($lockDir)) {
+        @mkdir($lockDir, 0755, true);
+    }
+
+    $stateFile = $lockDir . "/source_webhook_{$leadId}.state";
+    $now = time();
+    $lastRun = is_file($stateFile) ? (int) trim((string) @file_get_contents($stateFile)) : 0;
+
+    if ($lastRun > 0 && ($now - $lastRun) < $seconds) {
+        log_message('INFO: sourceHook пропущен по cooldown', [
+            'lead_id' => $leadId,
+            'seconds' => $seconds,
+            'last_run_at' => date('c', $lastRun),
+        ], 'sourceHook.php');
+        return false;
+    }
+
+    @file_put_contents($stateFile, (string) $now, LOCK_EX);
+    return true;
+}
 ?>
