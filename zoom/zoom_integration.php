@@ -398,8 +398,30 @@ function zoom_update_meeting(array $config, string $meetingId, array $interval):
 
 function zoom_get_recording(array $config, string $meetingId, string $meetingUuid): array
 {
-    $identifier = $meetingUuid !== '' ? $meetingUuid : $meetingId;
-    return zoom_api_request($config, 'GET', '/meetings/' . rawurlencode($identifier) . '/recordings');
+    // Для scheduled-встреч (type=2) список записей одинаков для id и uuid,
+    // а id не содержит спецсимволов — запрашиваем по нему в первую очередь.
+    if ($meetingId !== '') {
+        try {
+            return zoom_api_request($config, 'GET', '/meetings/' . rawurlencode($meetingId) . '/recordings');
+        } catch (Throwable $exception) {
+            if ($meetingUuid === '') {
+                throw $exception;
+            }
+        }
+    }
+
+    if ($meetingUuid === '') {
+        throw new RuntimeException('Zoom: не указан ни meeting id, ни uuid для получения записи.');
+    }
+
+    // Zoom требует двойного URL-кодирования uuid, начинающегося с "/"
+    // или содержащего "//", иначе uuid ломает путь запроса (ошибка 3301
+    // "This recording does not exist").
+    $identifier = ($meetingUuid[0] === '/' || str_contains($meetingUuid, '//'))
+        ? rawurlencode(rawurlencode($meetingUuid))
+        : rawurlencode($meetingUuid);
+
+    return zoom_api_request($config, 'GET', '/meetings/' . $identifier . '/recordings');
 }
 
 function zoom_recording_url(array $recording): string
