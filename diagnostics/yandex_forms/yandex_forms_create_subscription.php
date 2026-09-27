@@ -2,20 +2,16 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/yandex_forms_common.php';
+require_once __DIR__ . '/../../yandex_forms_common.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
-function yandex_forms_configure_request(string $method, string $path, ?array $body = null, bool $expectJson = true): array
+function yandex_forms_subscription_request(string $method, string $path, ?array $body = null, bool $expectJson = true): array
 {
     $config = yandex_forms_config();
     $token = trim((string)($config['token'] ?? ''));
     $orgId = trim((string)($config['org_id'] ?? ''));
     $apiBaseUrl = rtrim((string)($config['api_base_url'] ?? 'https://api.forms.yandex.net/v1'), '/');
-
-    if ($token === '') {
-        throw new RuntimeException('Не задан YANDEX_FORMS_TOKEN.');
-    }
 
     $headers = [
         'Authorization: OAuth ' . $token,
@@ -75,32 +71,43 @@ function yandex_forms_configure_request(string $method, string $path, ?array $bo
 
 try {
     $surveyId = '6a738889381ea61914181597';
+    $answerVarId = '507f1f77bcf86cd799439012';
+    $hook = yandex_forms_subscription_request('POST', '/surveys/' . $surveyId . '/hooks', [
+        'name' => 'amoCRM webhook',
+        'active' => true,
+    ]);
 
-    $result = [
-        'survey' => null,
-        'questions' => null,
-        'hooks' => null,
-        'variables' => null,
+    $hookId = (int)($hook['id'] ?? 0);
+    if ($hookId <= 0) {
+        throw new RuntimeException('API не вернул ID группы действий.');
+    }
+
+    $subscriptionBody = [
+        'type' => 'http',
+        'active' => true,
+        'name' => 'POST to webhook',
+        'url' => 'https://srm.chinatutor.ru/diagnostics/yandex_forms/yandex_forms_echo.php',
+        'method' => 'post',
+        'body' => '{"answer_id":"{' . $answerVarId . '}"}',
+        'headers' => [],
+        'variables' => [
+            [
+                'id' => $answerVarId,
+                'type' => 'form.answer_id',
+            ],
+        ],
     ];
 
-    foreach ([
-        'survey' => ['GET', '/surveys/' . $surveyId],
-        'questions' => ['GET', '/surveys/' . $surveyId . '/questions'],
-        'hooks' => ['GET', '/surveys/' . $surveyId . '/hooks'],
-        'variables' => ['GET', '/surveys/' . $surveyId . '/variables'],
-    ] as $key => $request) {
-        try {
-            $result[$key] = yandex_forms_configure_request($request[0], $request[1]);
-        } catch (Throwable $e) {
-            $result[$key] = [
-                'error' => $e->getMessage(),
-            ];
-        }
-    }
+    $subscription = yandex_forms_subscription_request(
+        'POST',
+        '/surveys/' . $surveyId . '/hooks/' . $hookId . '/subscriptions',
+        $subscriptionBody
+    );
 
     echo json_encode([
         'success' => true,
-        'result' => $result,
+        'hook' => $hook,
+        'subscription' => $subscription,
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
 } catch (Throwable $e) {
     http_response_code(500);

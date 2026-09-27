@@ -543,6 +543,19 @@ function normalizeOkiLevelForAmo(?string $value): ?string
     return $map[$normalized] ?? trim($value);
 }
 
+function normalizeHollyLevel(?string $value): ?string
+{
+    $level = trim((string) $value);
+    if ($level === '') return null;
+    $normalized = mb_strtolower($level, 'UTF-8');
+    $normalized = str_replace(['‑', '–', '—', '_'], '-', $normalized);
+    $normalized = preg_replace('/\s+/u', ' ', $normalized);
+    return match ($normalized) {
+        'c1-c2', 'c1 c2' => 'C1',
+        default => $level,
+    };
+}
+
 function normalizeOkiLanguageForAmo(?string $value): ?string
 {
     if ($value === null || trim($value) === '') {
@@ -1012,7 +1025,7 @@ function extractLeadCustomFields(array $customFieldsValues): array
                 $fields["discipline"] = $value;
                 break;
             case AMO_FIELD_LEVEL:
-                $fields["level"] = $value;
+                $fields["level"] = normalizeHollyLevel((string) $value);
                 break;
             case AMO_FIELD_LEARNING_TYPE:
                 $fields["learningType"] = $value;

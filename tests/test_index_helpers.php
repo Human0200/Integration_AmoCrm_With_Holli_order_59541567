@@ -68,6 +68,7 @@ $subdomain = 'directorchinatutorru';
 $sourceFile = tests_project_root() . '/index.php';
 tests_load_functions($sourceFile, [
     'normalizeOkiLevelForAmo',
+    'normalizeHollyLevel',
     'normalizeOkiLanguageForAmo',
     'normalizeOkiDateForAmo',
     'normalizeHollyCustomDateValue',
@@ -85,6 +86,8 @@ tests_load_functions($sourceFile, [
 
 tests_assert_same('A1', normalizeOkiLevelForAmo('beginner'), 'Oki level mapping should normalize beginner.');
 tests_assert_same('B1', normalizeOkiLevelForAmo('pre-intermediate'), 'Oki level mapping should normalize pre-intermediate.');
+tests_assert_same('C1-C2', normalizeOkiLevelForAmo('C1-C2'), 'Source CRM level should remain unchanged.');
+tests_assert_same('C1', normalizeHollyLevel('C1-C2'), 'Holly C1-C2 should map to available C1.');
 tests_assert_same('Китайский', normalizeOkiLanguageForAmo('chinese'), 'Language mapping should normalize english names.');
 tests_assert_same('РКИ', normalizeOkiLanguageForAmo('рки'), 'Language mapping should preserve supported acronyms.');
 tests_assert_same('2026-08-31', normalizeOkiDateForAmo('31.08.2026'), 'Oki date should normalize dd.mm.yyyy.');
@@ -108,6 +111,9 @@ $leadFields = extractLeadCustomFields([
     ['field_id' => AMO_FIELD_PROFILE_LINK, 'values' => [['value' => 'https://evrasia20.t8s.ru/Profile/28111']]],
 ]);
 tests_assert_same('Китайский', $leadFields['discipline'], 'Discipline field should map from amo.');
+tests_assert_same('C1', extractLeadCustomFields([
+    ['field_id' => AMO_FIELD_LEVEL, 'values' => [['value' => 'C1-C2']]],
+])['level'], 'C1-C2 must be sent to Holly as C1.');
 tests_assert_same('Индивидуально онлайн', $leadFields['learningType'], 'Learning type should be overridden by the more specific format.');
 tests_assert_same('12', $leadFields['hollyPackage'], 'Holly package should map from amo custom field.');
 tests_assert_same('Да', $leadFields['hollyComboActive'], 'Combo Active should map from amo custom field.');

@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/yandex_forms_common.php';
+require_once __DIR__ . '/../../yandex_forms_common.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
-function yandex_forms_create_test_request(string $method, string $path, ?array $body = null, bool $expectJson = true): array
+function yandex_forms_delete_test_request(string $method, string $path, bool $expectJson = true): array
 {
     $config = yandex_forms_config();
     $token = trim((string)($config['token'] ?? ''));
@@ -26,10 +26,6 @@ function yandex_forms_create_test_request(string $method, string $path, ?array $
         $headers[] = 'X-Org-Id: ' . $orgId;
     }
 
-    if ($body !== null) {
-        $headers[] = 'Content-Type: application/json';
-    }
-
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL => $apiBaseUrl . '/' . ltrim($path, '/'),
@@ -40,10 +36,6 @@ function yandex_forms_create_test_request(string $method, string $path, ?array $
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_SSL_VERIFYPEER => true,
     ]);
-
-    if ($body !== null) {
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    }
 
     $response = curl_exec($ch);
     $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -74,48 +66,31 @@ function yandex_forms_create_test_request(string $method, string $path, ?array $
 }
 
 try {
-    $survey = yandex_forms_create_test_request('POST', '/surveys/', [
-        'name' => 'Тестовая форма 2 вопроса',
-        'texts' => [
-            'submit' => 'Отправить',
-            'title' => 'Спасибо за ответы!',
-            'subtitle' => 'Тестовая форма успешно отправлена.',
-        ],
-    ]);
+    $response = yandex_forms_delete_test_request('GET', '/surveys');
+    $forms = yandex_forms_extract_forms_from_response($response);
+    $deleted = [];
 
-    $surveyId = trim((string)($survey['id'] ?? ''));
-    if ($surveyId === '') {
-        throw new RuntimeException('API не вернул ID созданной формы.');
+    foreach ($forms as $form) {
+        if (!is_array($form)) {
+            continue;
+        }
+
+        $name = trim((string)($form['name'] ?? ''));
+        $formId = trim((string)($form['id'] ?? ''));
+        if ($name !== 'Тестовая форма amoCRM' || $formId === '') {
+            continue;
+        }
+
+        $result = yandex_forms_delete_test_request('DELETE', '/surveys/' . rawurlencode($formId) . '/', false);
+        $deleted[] = [
+            'id' => $formId,
+            'status' => (int)($result['status'] ?? 0),
+        ];
     }
-
-    $questions = [];
-
-    $questions[] = yandex_forms_create_test_request('POST', '/surveys/' . rawurlencode($surveyId) . '/questions/', [
-        'type' => 'string',
-        'label' => 'Как вас зовут?',
-        'placeholder' => 'Введите имя',
-        'multiline' => false,
-        'required' => true,
-    ]);
-
-    $questions[] = yandex_forms_create_test_request('POST', '/surveys/' . rawurlencode($surveyId) . '/questions/', [
-        'type' => 'string',
-        'label' => 'Ваш телефон',
-        'placeholder' => '+7 (999) 123-45-67',
-        'multiline' => false,
-        'required' => true,
-    ]);
-
-    $publish = yandex_forms_create_test_request('POST', '/surveys/' . rawurlencode($surveyId) . '/publish/', null, false);
 
     echo json_encode([
         'success' => true,
-        'survey_id' => $surveyId,
-        'question_ids' => array_map(static function (array $question): int {
-            return (int)($question['id'] ?? 0);
-        }, $questions),
-        'public_url' => 'https://forms.yandex.ru/u/' . rawurlencode($surveyId) . '/',
-        'publish_status' => (int)($publish['status'] ?? 0),
+        'deleted' => $deleted,
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 } catch (Throwable $e) {
     http_response_code(500);

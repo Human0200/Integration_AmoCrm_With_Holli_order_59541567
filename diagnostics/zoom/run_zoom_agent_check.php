@@ -1,10 +1,10 @@
 <?php
 declare(strict_types=1);
 
-require_once dirname(__DIR__) . '/config.php';
+require_once __DIR__ . '/../../config.php';
 
 $leadId = 31579761;
-$tokens = json_decode((string) file_get_contents(dirname(__DIR__) . '/tokens.json'), true);
+$tokens = json_decode((string) file_get_contents(__DIR__ . '/../../tokens.json'), true);
 $now = time();
 $start = $now + 23 * 3600;
 $end = $start + 3600;

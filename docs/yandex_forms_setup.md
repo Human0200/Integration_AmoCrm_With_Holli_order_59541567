@@ -2,11 +2,11 @@
 
 ## Что добавлено
 
-- [yandex_forms_api.php](./yandex_forms_api.php) — API для amo-виджета, получает список форм из Яндекс.Форм и возвращает готовые ссылки с `amo_lead_id`.
-- [yandex_forms_webhook.php](./yandex_forms_webhook.php) — webhook-обработчик ответов формы.
-- [yandex_forms_result.php](./yandex_forms_result.php) — публичная страница с результатом анкеты.
-- [yandex_forms_common.php](./yandex_forms_common.php) — общий helper для API Яндекс.Форм и обновления amoCRM.
-- [widget/yandex_forms_widget](./widget/yandex_forms_widget) — исходники private widget для карточки сделки.
+- [yandex_forms_api.php](../yandex_forms_api.php) — API для amo-виджета, получает список форм из Яндекс.Форм и возвращает готовые ссылки с `amo_lead_id`.
+- [yandex_forms_webhook.php](../yandex_forms_webhook.php) — webhook-обработчик ответов формы.
+- [yandex_forms_result.php](../yandex_forms_result.php) — публичная страница с результатом анкеты.
+- [yandex_forms_common.php](../yandex_forms_common.php) — общий helper для API Яндекс.Форм и обновления amoCRM.
+- [widget/yandex_forms_widget](../widget/yandex_forms_widget) — исходники private widget для карточки сделки.
 
 ## Что нужно настроить в `.env`
 
@@ -102,10 +102,10 @@ https://forms.yandex.ru/u/<form_id>/?amo_lead_id=<lead_id>
 
 Исходники лежат в:
 
-- [widget/yandex_forms_widget](./widget/yandex_forms_widget)
+- [widget/yandex_forms_widget](../widget/yandex_forms_widget)
 
 Сборка архива:
 
 ```bash
-./build_yandex_forms_widget.sh
+../build_yandex_forms_widget.sh
 ```

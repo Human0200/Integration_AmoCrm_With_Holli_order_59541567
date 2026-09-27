@@ -2,16 +2,16 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/logger.php';
-require_once __DIR__ . '/config.php';
-require_once __DIR__ . '/amo_func.php';
+require_once __DIR__ . '/../../logger.php';
+require_once __DIR__ . '/../../config.php';
+require_once __DIR__ . '/../../amo_func.php';
 
 const BATCH_IMPORT_SOURCE = 'batch_import_source_closed_leads.php';
-const BATCH_IMPORT_LOG_FILE = __DIR__ . '/logs/batch_import_source_closed_leads.log';
+const BATCH_IMPORT_LOG_FILE = __DIR__ . '/../../logs/batch_import_source_closed_leads.log';
 const SOURCE_AMO_ACCESS_TOKEN = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImp0aSI6ImVmMjg5ODQ2YTBlZmE4MTEyYTgwYTUyZTcyOTU5M2FjM2NlMWFlMzE2ZmQ4ZTZlZDNkMjE0YjkxN2JmZmRlNmI4ZGRhZDYxNzQ1MmVhZDE5In0.eyJhdWQiOiIwNTQ0ZDY3NC00MmI4LTRiYTMtOTBlZC02OTM4MGFkMzNjNWQiLCJqdGkiOiJlZjI4OTg0NmEwZWZhODExMmE4MGE1MmU3Mjk1OTNhYzNjZTFhZTMxNmZkOGU2ZWQzZDIxNGI5MTdiZmZkZTZiOGRkYWQ2MTc0NTJlYWQxOSIsImlhdCI6MTc4NjE4NzMxNSwibmJmIjoxNzg2MTg3MzE1LCJleHAiOjE4NDYwMjI0MDAsInN1YiI6IjEyNjQyMzE0IiwiZ3JhbnRfdHlwZSI6IiIsImFjY291bnRfaWQiOjMyNDk1NjI2LCJiYXNlX2RvbWFpbiI6ImFtb2NybS5ydSIsInZlcnNpb24iOjIsInNjb3BlcyI6WyJwdXNoX25vdGlmaWNhdGlvbnMiLCJmaWxlcyIsImNybSIsImZpbGVzX2RlbGV0ZSIsIm5vdGlmaWNhdGlvbnMiXSwiaGFzaF91dWlkIjoiZGJkZGMwNjItOTAxYS00NjA0LTk3YTItYzc3OWRlMDZkYTZkIiwiYXBpX2RvbWFpbiI6ImFwaS1iLmFtb2NybS5ydSJ9.MdFT-9mnH3NzHqNeeiwLtaLLFBcx2bbz3S6wks7o43SHg1jCcI10DbwzCgVMfjtCOs666MIKPrQXcFFijzKfGI3AwuOK-3tOQafk-f9mLqy-3IqTjhFcnr-vaHSrqg1l6XmVi5W933YpTrWP7ocB-DVXHuzcG8GxuSdRP4VJfQEW0ZijGxX8x1OhPy7Nu_-9QmGqSObCoGHVXjNSJ-uxlO9anBJuNwCNj_meoa4mbRppUo6S0c-mi7ZPy-ab60UPJC3n3QTuuYXWMK3AuX7L-dIKH-i3TRhj9d9WFQiYBOTLTsZCEQzfMWTx8KzcnfjIlxhUIBI-6fK5CYGUi9Fwpg';
 const SOURCE_AMO_BASE_URL = 'https://supportchinatutorru.amocrm.ru';
-const SOURCE_STATUSES_FILE = __DIR__ . '/source_closed_statuses.json';
-const IMPORT_STATE_FILE = __DIR__ . '/batch_import_source_closed_leads_state.json';
+const SOURCE_STATUSES_FILE = __DIR__ . '/../../source_closed_statuses.json';
+const IMPORT_STATE_FILE = __DIR__ . '/../../batch_import_source_closed_leads_state.json';
 
 const TARGET_AMO_PIPELINE_ID = 9919562;
 const TARGET_AMO_STATUS_ID = 84476154;

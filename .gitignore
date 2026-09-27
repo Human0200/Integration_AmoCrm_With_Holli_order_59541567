@@ -4,4 +4,12 @@
 *.docx
 *.json
 *.env
+*.zip
 locks/
+logs/*
+!logs/.gitkeep
+data/zoom/*
+!data/zoom/.gitkeep
+data/yandex_forms/*
+!data/yandex_forms/.gitkeep
+data/zoom_test/

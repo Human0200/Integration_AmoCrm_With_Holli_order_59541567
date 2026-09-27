@@ -1,6 +1,6 @@
 <?php
-require_once dirname(__DIR__) . '/config.php';
-$tokens = json_decode((string) file_get_contents(dirname(__DIR__) . '/tokens.json'), true);
+require_once __DIR__ . '/../../config.php';
+$tokens = json_decode((string) file_get_contents(__DIR__ . '/../../tokens.json'), true);
 $ch = curl_init('https://directorchinatutorru.amocrm.ru/api/v4/bots/25585/run');
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,

@@ -2,8 +2,8 @@
 
 declare(strict_types=1);
 
-require_once dirname(__DIR__) . '/config.php';
-require_once dirname(__DIR__) . '/amo_func.php';
+require_once __DIR__ . '/../../config.php';
+require_once __DIR__ . '/../../amo_func.php';
 
 $subdomain = (string) ($GLOBALS['subdomain'] ?? '');
 $accessToken = (string) (($GLOBALS['data'] ?? [])['access_token'] ?? '');

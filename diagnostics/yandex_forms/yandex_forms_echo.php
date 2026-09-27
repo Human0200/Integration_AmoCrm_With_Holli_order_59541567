@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-$storageDir = __DIR__ . '/data/yandex_forms';
+$storageDir = __DIR__ . '/../../data/yandex_forms';
 if (!is_dir($storageDir)) {
     mkdir($storageDir, 0775, true);
 }

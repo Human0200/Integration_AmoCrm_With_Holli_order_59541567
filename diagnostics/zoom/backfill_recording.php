@@ -7,12 +7,12 @@ if (PHP_SAPI !== 'cli') {
     exit;
 }
 
-require_once __DIR__ . '/zoom_integration.php';
-require_once dirname(__DIR__) . '/amo_func.php';
+require_once __DIR__ . '/../../zoom/zoom_integration.php';
+require_once __DIR__ . '/../../amo_func.php';
 
 $leadId = isset($argv[1]) ? (int) $argv[1] : 0;
 if ($leadId <= 0) {
-    fwrite(STDERR, "Usage: php zoom/backfill_recording.php <amo_lead_id>\n");
+    fwrite(STDERR, "Usage: php diagnostics/zoom/backfill_recording.php <amo_lead_id>\n");
     exit(1);
 }
 

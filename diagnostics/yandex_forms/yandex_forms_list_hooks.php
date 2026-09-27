@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/yandex_forms_common.php';
+require_once __DIR__ . '/../../yandex_forms_common.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
-function yandex_forms_cleanup_hooks_request(string $method, string $path, ?array $body = null, bool $expectJson = true): array
+function yandex_forms_list_hooks_request(string $method, string $path): array
 {
     $config = yandex_forms_config();
     $token = trim((string)($config['token'] ?? ''));
@@ -22,10 +22,6 @@ function yandex_forms_cleanup_hooks_request(string $method, string $path, ?array
         $headers[] = 'X-Org-Id: ' . $orgId;
     }
 
-    if ($body !== null) {
-        $headers[] = 'Content-Type: application/json';
-    }
-
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL => $apiBaseUrl . '/' . ltrim($path, '/'),
@@ -36,10 +32,6 @@ function yandex_forms_cleanup_hooks_request(string $method, string $path, ?array
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_SSL_VERIFYPEER => true,
     ]);
-
-    if ($body !== null) {
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    }
 
     $response = curl_exec($ch);
     $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -54,16 +46,9 @@ function yandex_forms_cleanup_hooks_request(string $method, string $path, ?array
         throw new RuntimeException('API Яндекс Форм вернул HTTP ' . $httpCode . ': ' . mb_substr((string)$response, 0, 2000, 'UTF-8'));
     }
 
-    if (!$expectJson) {
-        return [
-            'status' => $httpCode,
-            'raw' => (string)$response,
-        ];
-    }
-
     $decoded = json_decode((string)$response, true);
     if (!is_array($decoded)) {
-        return [];
+        throw new RuntimeException('API Яндекс Форм вернул некорректный JSON: ' . mb_substr((string)$response, 0, 2000, 'UTF-8'));
     }
 
     return $decoded;
@@ -71,41 +56,33 @@ function yandex_forms_cleanup_hooks_request(string $method, string $path, ?array
 
 try {
     $surveyId = '6a738889381ea61914181597';
-    $keepHookId = 18116332;
-
-    $hooks = yandex_forms_cleanup_hooks_request('GET', '/surveys/' . $surveyId . '/hooks');
-    $deleted = [];
-    $kept = [];
+    $hooks = yandex_forms_list_hooks_request('GET', '/surveys/' . $surveyId . '/hooks');
+    $result = [];
 
     foreach ($hooks as $hook) {
         $hookId = (int)($hook['id'] ?? 0);
-        if ($hookId <= 0) {
-            continue;
-        }
-
-        if ($hookId === $keepHookId) {
-            $kept[] = $hookId;
-            continue;
-        }
-
-        $result = yandex_forms_cleanup_hooks_request(
-            'DELETE',
-            '/surveys/' . $surveyId . '/hooks/' . $hookId,
-            null,
-            false
-        );
-
-        $deleted[] = [
-            'id' => $hookId,
-            'status' => (int)($result['status'] ?? 0),
+        $entry = [
+            'hook' => $hook,
+            'subscriptions' => [],
         ];
+
+        if ($hookId > 0) {
+            try {
+                $entry['subscriptions'] = yandex_forms_list_hooks_request(
+                    'GET',
+                    '/surveys/' . $surveyId . '/hooks/' . $hookId . '/subscriptions'
+                );
+            } catch (Throwable $e) {
+                $entry['subscriptions_error'] = $e->getMessage();
+            }
+        }
+
+        $result[] = $entry;
     }
 
     echo json_encode([
         'success' => true,
-        'keep_hook_id' => $keepHookId,
-        'kept' => $kept,
-        'deleted' => $deleted,
+        'result' => $result,
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
 } catch (Throwable $e) {
     http_response_code(500);
