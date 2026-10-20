@@ -11,6 +11,8 @@ php tests/test_telegram_helpers.php
 php tests/test_telegram_topics_helpers.php
 php tests/test_zoom_helpers.php
 php tests/test_zoom_salesbot_helpers.php
+php tests/test_salebot_amocrm_chat_bridge.php
+php tests/test_integration_salebot_helpers.php
 sh tests/test_yandex_forms_api.sh
 
 echo "ALL TESTS PASSED"
